@@ -1,11 +1,19 @@
-# Codex-container fleet-bus adapter — design (v4)
+# Codex-container fleet-bus adapter — design (v5)
 
 **Target repo:** [`artifice-ia/codex-container`](https://github.com/artifice-ia/codex-container)
 **Implements:** [SPEC.md](../SPEC.md) for the Python side
 **Consumers who will run this:** Vec, Ohm, Myc, Helm
 **Status:** design draft, not yet implemented
 
-**Changes since v3** (in response to Ohm v3 + Codex re-review):
+**Changes since v4** (in response to Ohm v4 + Codex re-review):
+
+- **No mutable-global dereference across `await`.** `_on_bus_envelope` receives an explicit `bus_instance: FleetBus` parameter (bound at delivery time by the owning FleetBus). All audit/publish/validate calls go through the bound instance, not `global _bus`. If NATS reconnects mid-turn, the old handler still audits via the old (now-drained) instance's log file; publish attempts get `codex_adapter_publish_bus_stale`. New instance starts clean.
+- **Every outbound audit has a non-null `req_id`.** Discord-triggered `<BUS>` tags generate a local nonce (`secrets.token_hex(16)`) via a helper. Bus-triggered turns pass the inbound `req_id` unchanged. Parser pre-routing failures use a non-null subject placeholder (`"parser"`) rather than `None` so §8's "subject on every entry" is actually satisfied.
+- **Single-pass XML entity decoder.** Replaces sequential `.replace()` calls. `&amp;lt;` now correctly decodes to `&lt;`, not `<`. Cap the entity set to the five we emit (`&amp; &lt; &gt; &quot; &apos;`), reject unknown entities as literals rather than passing them through.
+- **Malformed tags still stripped from text.** `_find_bus_tags` records the tag span even when parse fails, so `_process_bus_tags` removes the raw tag from the emitted-back text. A rejected `<BUS to = "..."/>` won't leak into a Discord reply.
+- **Subject-safe kind validation for broadcast.** Kind used in a broadcast subject must match `[a-z0-9._-]+` per NATS subject rules (no whitespace, no `*`, no `>`). Reject as `codex_adapter_broadcast_kind_invalid` if it doesn't; a project-specific kind with spaces stays valid on direct subjects (`fleet.<to>.request`) where the kind doesn't hit the subject.
+
+**Changes since v3:**
 
 - **Backslash preservation in attribute parsing.** `\"` unescapes only when the outer attribute quote is `"` (and same for `'`). Any other `\<c>` passes through unchanged so JSON escapes (`\n`, `\t`, `\"` inside `'...'`-quoted attributes) survive to `json.loads`.
 - **Invalid `hops` skips the whole outbound tag.** The v3 `continue` only advanced the inner `BATON_FIELDS` loop; malformed envelope was still publishing without hops. Now flagged with a per-tag sentinel that continues the outer loop.
@@ -124,14 +132,28 @@ async def _bus_lifecycle() -> None:
 Bus-triggered turns use `_ask_bus()` (dedicated code path, no Discord wiring) and run **only the bus tag processor**. `<CRON>` and other Discord-side capabilities MUST NOT be exposed to bus turns — unverified bus input inducing persistent scheduler state is exactly the kind of privilege leak the injection-frame separation exists to prevent (Ohm v2 finding #4).
 
 ```python
-async def _on_bus_envelope(subject: str, envelope: dict, req_id: str) -> None:
-    """Invoked by FleetBus for each validated envelope. `subject` is threaded
-    through so every audit event includes it per SPEC §8 (Codex finding #4)."""
+async def _on_bus_envelope(
+    bus_instance: "FleetBus",
+    subject: str,
+    envelope: dict,
+    req_id: str,
+) -> None:
+    """Invoked by FleetBus for each validated envelope. `bus_instance` is
+    the owning FleetBus captured at delivery time — do NOT dereference
+    the module-level `_bus` global across an await, because a reconnect
+    can rebind it under our feet (Ohm v4 #1).
+
+    `subject` is threaded through so every audit event includes it per
+    SPEC §8."""
+
+    # Alias for readability. bus is the bound instance; global _bus is
+    # ignored below.
+    bus = bus_instance
 
     try:
         frame = _build_injection_frame(envelope, req_id)
     except ValueError as e:
-        _bus.audit({
+        bus.audit({
             "dir": "drop", "subject": subject,
             "envelope_id": envelope.get("id"), "req_id": req_id,
             "reason": (
@@ -147,31 +169,32 @@ async def _on_bus_envelope(subject: str, envelope: dict, req_id: str) -> None:
         try:
             raw_reply = await _ask_bus(frame)
         except asyncio.TimeoutError:
-            _bus.audit({"dir": "drop", "subject": subject,
-                        "envelope_id": envelope["id"], "req_id": req_id,
-                        "reason": "codex_adapter_model_timeout"})
+            bus.audit({"dir": "drop", "subject": subject,
+                       "envelope_id": envelope["id"], "req_id": req_id,
+                       "reason": "codex_adapter_model_timeout"})
             return
         except Exception as e:
-            _bus.audit({"dir": "drop", "subject": subject,
-                        "envelope_id": envelope["id"], "req_id": req_id,
-                        "reason": "codex_adapter_model_error", "error": str(e)})
+            bus.audit({"dir": "drop", "subject": subject,
+                       "envelope_id": envelope["id"], "req_id": req_id,
+                       "reason": "codex_adapter_model_error", "error": str(e)})
             return
 
     # BUS-ONLY: only _process_bus_tags runs. NOT _process_cron_tags.
     # Bus input must not trigger scheduler changes (Ohm v2 finding #4).
     cleaned, bus_notes = await _process_bus_tags(
         raw_reply,
-        req_id=req_id,                # per Codex finding #5, propagate req_id
+        bus_instance=bus,             # v5 Ohm #1 — pass bound instance
+        req_id=req_id,                # bus-triggered: reuse inbound nonce
         in_reply_to=envelope["id"],   # per §11, auto-set
         subject_context=subject,      # for audit events
     )
 
     # Non-tag prose from a bus turn is discarded. Ohm v1 finding #2 still holds.
     if cleaned.strip():
-        _bus.audit({"dir": "drop", "subject": subject,
-                    "envelope_id": envelope["id"], "req_id": req_id,
-                    "reason": "codex_adapter_prose_from_bus_turn_discarded",
-                    "prose_length": len(cleaned)})
+        bus.audit({"dir": "drop", "subject": subject,
+                   "envelope_id": envelope["id"], "req_id": req_id,
+                   "reason": "codex_adapter_prose_from_bus_turn_discarded",
+                   "prose_length": len(cleaned)})
 
     # Note also: if the model emitted a <CRON> in a bus turn, it survives
     # into `cleaned` (since we don't run _process_cron_tags on bus turns),
@@ -266,14 +289,19 @@ Going with the hand-rolled parser.
 ```python
 def _find_bus_tags(
     text: str,
+    bus: "FleetBus",
     context: dict | None = None,
-) -> list[tuple[int, int, dict[str, str]]]:
+) -> list[tuple[int, int, dict[str, str] | None]]:
     """Scan text for <BUS ... /> tags, respecting quoted attributes.
-    Returns list of (start, end, attrs) tuples.
+    Returns list of (start, end, attrs_or_None) tuples.
 
     `context` (subject/req_id from the caller) is included in drop audits
-    per v4 Ohm #3 — parser-generated drops must carry the same context
-    the outbound path carries."""
+    per v4 Ohm #3.
+
+    v5 Codex #2: malformed tags STILL get recorded in results with
+    attrs=None so _process_bus_tags removes their spans from the emitted
+    text. This prevents a rejected `<BUS to = 'x'/>` from leaking into a
+    Discord reply."""
     context = context or {}
     results = []
     i = 0
@@ -316,27 +344,35 @@ def _find_bus_tags(
                         attrs = _parse_attrs(inner)
                         results.append((start, pos + 2, attrs))
                     except ValueError as e:
-                        _bus.audit({
+                        # v5 Codex #2: still record the span for removal
+                        # from text, even though we won't publish.
+                        results.append((start, pos + 2, None))
+                        bus.audit({
                             "dir": "drop",
                             "reason": "codex_adapter_outbound_tag_malformed",
                             "error": str(e),
                             "raw": text[start:pos + 2][:200],
-                            **context,  # subject, req_id from caller
+                            **context,
                         })
                     i = pos + 2
                     break
                 if c == "<":
-                    _bus.audit({
+                    # Nested tag detected — record the malformed span
+                    # from <BUS to the unexpected <, so it gets stripped.
+                    results.append((start, pos, None))
+                    bus.audit({
                         "dir": "drop",
                         "reason": "codex_adapter_outbound_tag_unclosed",
-                        "raw": text[start:start + 200],
+                        "raw": text[start:pos][:200],
                         **context,
                     })
-                    i = start + 4
+                    i = pos
                     break
                 pos += 1
         else:
-            _bus.audit({
+            # Ran off end of text — record from <BUS to end for stripping.
+            results.append((start, len(text), None))
+            bus.audit({
                 "dir": "drop",
                 "reason": "codex_adapter_outbound_tag_unclosed",
                 "raw": text[start:start + 200],
@@ -390,16 +426,34 @@ def _parse_attrs(inner: str) -> dict[str, str]:
             raise ValueError(f"unclosed quote for {key!r}")
         pos += 1  # skip closing quote
         raw_value = "".join(val_chars)
-        # Unescape XML entities (applied AFTER backslash handling, so &amp; in
-        # a JSON string survives to json.loads as &amp; which then decodes... wait,
-        # no: XML entities are the outer wrapper's escape mechanism, not JSON's.
-        # If a caller wrote &lt; in an attribute, they meant a literal < in the
-        # attribute value, then downstream (e.g., json.loads on payload) sees <.)
-        for entity, char in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
-                             ("&quot;", '"'), ("&apos;", "'")):
-            raw_value = raw_value.replace(entity, char)
-        attrs[key] = raw_value
+        # v5 Codex #1 / Ohm #3: single-pass XML entity decode. Sequential
+        # .replace() double-decodes: `&amp;lt;` → `&lt;` → `<` is wrong;
+        # single-pass leaves the second entity alone since it wasn't in
+        # the ORIGINAL text.
+        attrs[key] = _decode_xml_entities(raw_value)
     return attrs
+
+_ENTITY_MAP = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+_ENTITY_RE = re.compile(r"&([a-z]+);")
+
+def _decode_xml_entities(text: str) -> str:
+    """Single-pass decode of the five supported XML entities. Unknown
+    entities pass through unchanged (as literal `&foo;`) rather than
+    being reinterpreted.
+
+    Correct behavior:
+      &amp;         → &
+      &lt;          → <
+      &gt;          → >
+      &quot;        → "
+      &apos;        → '
+      &amp;lt;      → &lt;      (NOT <)
+      &amp;amp;    → &amp;      (single decoding)
+      &unknown;    → &unknown;  (pass through)
+    """
+    def replace(m):
+        return _ENTITY_MAP.get(m.group(1), m.group(0))
+    return _ENTITY_RE.sub(replace, text)
 ```
 
 Then in the processor:
@@ -407,37 +461,71 @@ Then in the processor:
 ```python
 BATON_FIELDS = {"root_id", "origin", "owner", "hops"}
 
+_NATS_SUBJECT_TOKEN_RE = re.compile(r"^[a-z0-9._-]+$")
+
 def _pick_publish_subject(env: dict) -> str:
     """SPEC §6: replies go to fleet.<to>.result, requests go to fleet.<to>.request.
-    Broadcasts (no `to`) go to fleet.broadcast.<kind>. Fix for Ohm v2 #1."""
+    Broadcasts (no `to`) go to fleet.broadcast.<kind>. Fix for Ohm v2 #1.
+
+    v5 Codex #3: SPEC.md §3 allows arbitrary project-specific kinds, but
+    for broadcasts the kind becomes a NATS subject token. Reject if the
+    kind contains whitespace, `*`, `>`, or anything else that would break
+    the subject. Direct routes don't have this problem since the kind
+    doesn't hit the subject."""
     if env.get("to") is None:
-        return f"fleet.broadcast.{env['kind']}"
+        kind = env["kind"]
+        if not _NATS_SUBJECT_TOKEN_RE.match(kind):
+            raise ValueError(
+                f"broadcast kind {kind!r} is not NATS-subject-safe "
+                f"(must match [a-z0-9._-]+)"
+            )
+        return f"fleet.broadcast.{kind}"
     if env.get("in_reply_to"):
         return f"fleet.{env['to']}.result"
     return f"fleet.{env['to']}.request"
 
 async def _process_bus_tags(
     text: str,
+    bus_instance: "FleetBus",
     req_id: str | None = None,
     in_reply_to: str | None = None,
     subject_context: str | None = None,
 ) -> tuple[str, list[str]]:
     """Extract <BUS ... /> tags, publish each async with per-tag failure isolation.
-    Returns (text-with-tags-removed, per-tag human-readable notes)."""
+    Returns (text-with-tags-removed, per-tag human-readable notes).
+
+    v5 Ohm #1: bus_instance is the bound FleetBus (from callback delivery),
+    not the module global. All audit/publish/validate calls use it.
+
+    v5 Ohm #2: If req_id is None (Discord-originated turn), generate a
+    local nonce so every audit has a non-null req_id per SPEC §8.
+    subject_context defaults to 'parser' — never None — so pre-routing
+    parser failures don't emit null subjects."""
+    bus = bus_instance
+    if req_id is None:
+        req_id = secrets.token_hex(16)
+    if subject_context is None:
+        subject_context = "parser"
+
     # v4 Ohm #3: parser-generated drops carry the same context outbound audits do
     context = {"subject": subject_context, "req_id": req_id}
-    tags = _find_bus_tags(text, context=context)
+    tags = _find_bus_tags(text, bus=bus, context=context)
     if not tags:
         return text, []
 
     notes = []
 
     for start, end, attrs in tags:
+        # v5 Codex #2: attrs is None when parser rejected the tag; the
+        # tag's span is still in `tags` so it gets stripped from text.
+        # Skip publish for parser-rejected tags.
+        if attrs is None:
+            continue
         try:
             payload = json.loads(attrs.get("payload", "{}"))
         except json.JSONDecodeError as e:
             notes.append(f"[bus tag ignored: payload JSON invalid: {e}]")
-            _bus.audit({
+            bus.audit({
                 "dir": "drop", "subject": subject_context,
                 "reason": "codex_adapter_outbound_tag_payload_json_invalid",
                 "raw": attrs.get("payload", "")[:200], "req_id": req_id,
@@ -474,7 +562,7 @@ async def _process_bus_tags(
                         env["hops"] = int(attrs["hops"])
                     except ValueError:
                         notes.append(f"[bus tag ignored: hops not integer]")
-                        _bus.audit({
+                        bus.audit({
                             "dir": "drop", "subject": subject_context,
                             "reason": "codex_adapter_outbound_baton_hops_not_integer",
                             "req_id": req_id,
@@ -486,23 +574,34 @@ async def _process_bus_tags(
         if baton_invalid:
             continue  # skip the whole tag
 
-        validation = _bus.validate_outbound(env)  # applies SPEC §5 reject codes
+        validation = bus.validate_outbound(env)  # applies SPEC §5 reject codes
         if not validation["ok"]:
             notes.append(f"[bus tag ignored: {validation['error']}]")
             # SPEC §5 codes are unprefixed — this is the standardized taxonomy
-            _bus.audit({
+            bus.audit({
                 "dir": "drop", "subject": subject_context,
                 "reason": validation["error"], "envelope_id": env["id"],
                 "req_id": req_id,
             })
             continue
 
-        subject = _pick_publish_subject(env)
+        try:
+            subject = _pick_publish_subject(env)
+        except ValueError as e:
+            # v5 Codex #3: broadcast kind not subject-safe.
+            notes.append(f"[bus tag ignored: {e}]")
+            bus.audit({
+                "dir": "drop", "subject": subject_context,
+                "reason": "codex_adapter_broadcast_kind_invalid",
+                "envelope_id": env["id"], "req_id": req_id,
+                "error": str(e),
+            })
+            continue
 
         try:
-            await _bus.publish(subject, env)
+            await bus.publish(subject, env)
             # SPEC §8: outbound audit MUST include envelope_id + req_id
-            _bus.audit({
+            bus.audit({
                 "dir": "out", "subject": subject,
                 "envelope_id": env["id"], "req_id": req_id,
             })
@@ -512,9 +611,17 @@ async def _process_bus_tags(
             )
         except Exception as e:
             notes.append(f"[bus publish failed: {e}]")
-            _bus.audit({
+            # v5 Ohm #1: if bus was disconnected mid-turn, publish will
+            # raise; classify as bus_stale rather than a generic error
+            # for postmortem clarity.
+            reason = (
+                "codex_adapter_publish_bus_stale"
+                if bus.is_closed()
+                else "codex_adapter_publish_error"
+            )
+            bus.audit({
                 "dir": "drop", "subject": subject,
-                "reason": "codex_adapter_publish_error",
+                "reason": reason,
                 "envelope_id": env["id"], "req_id": req_id,
                 "error": str(e),
             })
