@@ -1,11 +1,17 @@
-# Codex-container fleet-bus adapter — design (v5)
+# Codex-container fleet-bus adapter — design (v6)
 
 **Target repo:** [`artifice-ia/codex-container`](https://github.com/artifice-ia/codex-container)
 **Implements:** [SPEC.md](../SPEC.md) for the Python side
 **Consumers who will run this:** Vec, Ohm, Myc, Helm
 **Status:** design draft, not yet implemented
 
-**Changes since v4** (in response to Ohm v4 + Codex re-review):
+**Changes since v5** (in response to Codex re-review; Ohm's v5 review reposted v4 findings verbatim — treating as already-addressed):
+
+- **JSON payload rejects non-standard constants** (`NaN`, `Infinity`, `-Infinity`). `json.loads(..., parse_constant=_reject_json_constant)` on inbound-tag payloads catches these before publish; `json.dumps(..., allow_nan=False)` on outbound serialization catches them again. Prevents non-standard tokens from reaching JS `JSON.parse` consumers who'd reject the whole envelope.
+- **Broadcast subject regex uses `fullmatch` with non-empty dot-separated tokens.** Old `^[a-z0-9._-]+$` accepted `.release`, `release.`, `release..note`, and `foo\n`. New `re.compile(r'[a-z0-9_-]+(\.[a-z0-9_-]+)*')` matched with `.fullmatch()` rejects them all.
+- **Direct `to` validated against canonical bot name.** Old validation only rejected non-string/non-null. Now `to` must match `^[a-z0-9_-]+$` (via `normalize_bot_name` equivalent) BEFORE forming `fleet.<to>.request` / `fleet.<to>.result` — prevents `fleet..request` or `fleet.luna extra.request`.
+
+**Changes since v4:**
 
 - **No mutable-global dereference across `await`.** `_on_bus_envelope` receives an explicit `bus_instance: FleetBus` parameter (bound at delivery time by the owning FleetBus). All audit/publish/validate calls go through the bound instance, not `global _bus`. If NATS reconnects mid-turn, the old handler still audits via the old (now-drained) instance's log file; publish attempts get `codex_adapter_publish_bus_stale`. New instance starts clean.
 - **Every outbound audit has a non-null `req_id`.** Discord-triggered `<BUS>` tags generate a local nonce (`secrets.token_hex(16)`) via a helper. Bus-triggered turns pass the inbound `req_id` unchanged. Parser pre-routing failures use a non-null subject placeholder (`"parser"`) rather than `None` so §8's "subject on every entry" is actually satisfied.
@@ -242,7 +248,12 @@ def _escape_content(value: str) -> str:
     return escaped
 
 def _escape_payload_text(payload: dict) -> str:
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    # v6 Codex #1: outbound serialization forbids NaN/Infinity too, so
+    # a payload constructed programmatically from a float can't sneak
+    # a non-standard constant onto the wire.
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, allow_nan=False,
+    )
     return "".join(_XML_ESCAPE_MAP.get(c, c) for c in encoded)
 
 def _build_injection_frame(envelope: dict, req_id: str) -> str:
@@ -436,6 +447,18 @@ def _parse_attrs(inner: str) -> dict[str, str]:
 _ENTITY_MAP = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
 _ENTITY_RE = re.compile(r"&([a-z]+);")
 
+def _reject_json_constant(value: str) -> None:
+    """Passed to json.loads as parse_constant. Raises ValueError if
+    the JSON contains NaN, Infinity, or -Infinity — these are
+    non-standard constants Python accepts by default but JS JSON.parse
+    rejects, so envelopes carrying them would fail round-trip.
+
+    v6 Codex #1."""
+    raise ValueError(
+        f"non-standard JSON constant {value!r} not allowed in bus payloads"
+    )
+
+
 def _decode_xml_entities(text: str) -> str:
     """Single-pass decode of the five supported XML entities. Unknown
     entities pass through unchanged (as literal `&foo;`) rather than
@@ -461,28 +484,39 @@ Then in the processor:
 ```python
 BATON_FIELDS = {"root_id", "origin", "owner", "hops"}
 
-_NATS_SUBJECT_TOKEN_RE = re.compile(r"^[a-z0-9._-]+$")
+_BOT_NAME_RE = re.compile(r"[a-z0-9_-]+")
+_NATS_SUBJECT_KIND_RE = re.compile(r"[a-z0-9_-]+(\.[a-z0-9_-]+)*")
 
 def _pick_publish_subject(env: dict) -> str:
     """SPEC §6: replies go to fleet.<to>.result, requests go to fleet.<to>.request.
-    Broadcasts (no `to`) go to fleet.broadcast.<kind>. Fix for Ohm v2 #1.
+    Broadcasts (no `to`) go to fleet.broadcast.<kind>.
 
-    v5 Codex #3: SPEC.md §3 allows arbitrary project-specific kinds, but
-    for broadcasts the kind becomes a NATS subject token. Reject if the
-    kind contains whitespace, `*`, `>`, or anything else that would break
-    the subject. Direct routes don't have this problem since the kind
-    doesn't hit the subject."""
-    if env.get("to") is None:
+    v6 Codex #2: broadcast kind matcher uses fullmatch with non-empty
+    dot-separated tokens. Rejects .release / release. / release..note /
+    trailing-newline attacks that the earlier `[a-z0-9._-]+` pattern
+    accepted.
+
+    v6 Codex #3: direct `to` must match canonical bot-name pattern
+    BEFORE forming a subject. Prevents fleet..request, fleet.luna
+    extra.request, fleet.*.request from ever reaching publish."""
+    to = env.get("to")
+    if to is None:
         kind = env["kind"]
-        if not _NATS_SUBJECT_TOKEN_RE.match(kind):
+        if not _NATS_SUBJECT_KIND_RE.fullmatch(kind):
             raise ValueError(
                 f"broadcast kind {kind!r} is not NATS-subject-safe "
-                f"(must match [a-z0-9._-]+)"
+                f"(must be non-empty dot-separated [a-z0-9_-]+ tokens)"
             )
         return f"fleet.broadcast.{kind}"
+    # Direct route — `to` becomes a subject token.
+    if not isinstance(to, str) or not _BOT_NAME_RE.fullmatch(to):
+        raise ValueError(
+            f"direct recipient {to!r} is not a canonical bot name "
+            f"(must match [a-z0-9_-]+)"
+        )
     if env.get("in_reply_to"):
-        return f"fleet.{env['to']}.result"
-    return f"fleet.{env['to']}.request"
+        return f"fleet.{to}.result"
+    return f"fleet.{to}.request"
 
 async def _process_bus_tags(
     text: str,
@@ -522,13 +556,21 @@ async def _process_bus_tags(
         if attrs is None:
             continue
         try:
-            payload = json.loads(attrs.get("payload", "{}"))
-        except json.JSONDecodeError as e:
+            # v6 Codex #1: reject non-standard JSON constants (NaN,
+            # Infinity, -Infinity) that Python's json.loads accepts by
+            # default. JS consumers using JSON.parse reject the whole
+            # envelope on these; better to fail here with a clear reason.
+            payload = json.loads(
+                attrs.get("payload", "{}"),
+                parse_constant=_reject_json_constant,
+            )
+        except (json.JSONDecodeError, ValueError) as e:
             notes.append(f"[bus tag ignored: payload JSON invalid: {e}]")
             bus.audit({
                 "dir": "drop", "subject": subject_context,
                 "reason": "codex_adapter_outbound_tag_payload_json_invalid",
                 "raw": attrs.get("payload", "")[:200], "req_id": req_id,
+                "error": str(e),
             })
             continue
 
