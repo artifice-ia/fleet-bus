@@ -1,11 +1,19 @@
-# Codex-container fleet-bus adapter — design (v3)
+# Codex-container fleet-bus adapter — design (v4)
 
 **Target repo:** [`artifice-ia/codex-container`](https://github.com/artifice-ia/codex-container)
 **Implements:** [SPEC.md](../SPEC.md) for the Python side
 **Consumers who will run this:** Vec, Ohm, Myc, Helm
 **Status:** design draft, not yet implemented
 
-**Changes since v2** (in response to Ohm's DeetGates review + Codex re-review of PR #1):
+**Changes since v3** (in response to Ohm v3 + Codex re-review):
+
+- **Backslash preservation in attribute parsing.** `\"` unescapes only when the outer attribute quote is `"` (and same for `'`). Any other `\<c>` passes through unchanged so JSON escapes (`\n`, `\t`, `\"` inside `'...'`-quoted attributes) survive to `json.loads`.
+- **Invalid `hops` skips the whole outbound tag.** The v3 `continue` only advanced the inner `BATON_FIELDS` loop; malformed envelope was still publishing without hops. Now flagged with a per-tag sentinel that continues the outer loop.
+- **Baton fields exposed in injection frame.** `_build_injection_frame` now emits `root_id`/`origin`/`owner`/`hops` as optional attributes when present on the inbound envelope. Field pass-through works both directions.
+- **Parser-generated drop audits carry `subject`/`req_id`.** `_find_bus_tags` and `_parse_attrs` take a `context` param threaded through from the caller.
+- **All adapter-specific audit reasons prefixed `codex_adapter_`.** SPEC §5 codes (unprefixed) reserved for the standardized reject taxonomy. Adapter-invented reasons (model_timeout, publish_error, envelope_frame_too_large, outbound_tag_*, prose_from_bus_turn_discarded, etc.) become `codex_adapter_<code>` per SPEC §8.
+
+**Changes since v2:**
 
 Ohm v2 (5 findings):
 - Replies now route to `fleet.<to>.result`, not `.request` (SPEC §6)
@@ -123,13 +131,14 @@ async def _on_bus_envelope(subject: str, envelope: dict, req_id: str) -> None:
     try:
         frame = _build_injection_frame(envelope, req_id)
     except ValueError as e:
-        # Frame construction failed (e.g. attribute overrun >1024 chars).
-        # Codex finding #1: this used to raise before the try, silently
-        # aborting without an audit. Now handled explicitly.
         _bus.audit({
             "dir": "drop", "subject": subject,
             "envelope_id": envelope.get("id"), "req_id": req_id,
-            "reason": "envelope_frame_too_large" if "1024" in str(e) else "envelope_frame_invalid",
+            "reason": (
+                "codex_adapter_envelope_frame_too_large"
+                if "1024" in str(e)
+                else "codex_adapter_envelope_frame_invalid"
+            ),
             "error": str(e),
         })
         return
@@ -140,12 +149,12 @@ async def _on_bus_envelope(subject: str, envelope: dict, req_id: str) -> None:
         except asyncio.TimeoutError:
             _bus.audit({"dir": "drop", "subject": subject,
                         "envelope_id": envelope["id"], "req_id": req_id,
-                        "reason": "model_timeout"})
+                        "reason": "codex_adapter_model_timeout"})
             return
         except Exception as e:
             _bus.audit({"dir": "drop", "subject": subject,
                         "envelope_id": envelope["id"], "req_id": req_id,
-                        "reason": "model_error", "error": str(e)})
+                        "reason": "codex_adapter_model_error", "error": str(e)})
             return
 
     # BUS-ONLY: only _process_bus_tags runs. NOT _process_cron_tags.
@@ -161,7 +170,7 @@ async def _on_bus_envelope(subject: str, envelope: dict, req_id: str) -> None:
     if cleaned.strip():
         _bus.audit({"dir": "drop", "subject": subject,
                     "envelope_id": envelope["id"], "req_id": req_id,
-                    "reason": "prose_from_bus_turn_discarded",
+                    "reason": "codex_adapter_prose_from_bus_turn_discarded",
                     "prose_length": len(cleaned)})
 
     # Note also: if the model emitted a <CRON> in a bus turn, it survives
@@ -214,13 +223,23 @@ def _escape_payload_text(payload: dict) -> str:
     return "".join(_XML_ESCAPE_MAP.get(c, c) for c in encoded)
 
 def _build_injection_frame(envelope: dict, req_id: str) -> str:
+    # v4 Ohm #2: baton fields must be preserved on inbound and visible to
+    # the model in the injection frame. They're identifier-shaped
+    # (correlate with audit log), so use _escape_identifier.
+    extra = []
+    for baton_field in ("root_id", "origin", "owner", "hops"):
+        if baton_field in envelope and envelope[baton_field] is not None:
+            extra.append(
+                f'{baton_field}="{_escape_identifier(str(envelope[baton_field]))}"'
+            )
+    extra_str = (" " + " ".join(extra)) if extra else ""
     return (
         f'<channel source="fleet-bus" authenticated="false" '
         f'from_claim="{_escape_content(envelope["from"])}" '
         f'kind="{_escape_content(envelope["kind"])}" '
         f'env_id="{_escape_identifier(envelope["id"])}" '
         f'req_id="{_escape_identifier(req_id)}" '
-        f'ts="{_escape_identifier(envelope["ts"])}">\n'
+        f'ts="{_escape_identifier(envelope["ts"])}"{extra_str}>\n'
         f'<payload>{_escape_payload_text(envelope["payload"])}</payload>\n'
         f'</channel>'
     )
@@ -245,12 +264,17 @@ Replace with a proper attribute-parsing helper. Options considered:
 Going with the hand-rolled parser.
 
 ```python
-def _find_bus_tags(text: str) -> list[tuple[int, int, dict[str, str]]]:
+def _find_bus_tags(
+    text: str,
+    context: dict | None = None,
+) -> list[tuple[int, int, dict[str, str]]]:
     """Scan text for <BUS ... /> tags, respecting quoted attributes.
     Returns list of (start, end, attrs) tuples.
 
-    Only whole self-closing tags with balanced quotes are recognized.
-    Malformed tags are skipped with an audit event."""
+    `context` (subject/req_id from the caller) is included in drop audits
+    per v4 Ohm #3 — parser-generated drops must carry the same context
+    the outbound path carries."""
+    context = context or {}
     results = []
     i = 0
     while True:
@@ -262,13 +286,17 @@ def _find_bus_tags(text: str) -> list[tuple[int, int, dict[str, str]]]:
             i = start + 4
             continue
 
-        # Walk forward, tracking quote state, until we hit '/>' at depth 0
+        # Walk forward, tracking quote state, until we hit '/>' at depth 0.
+        # v4 Codex #1: only unescape backslash before the outer quote char.
+        # Every other backslash passes through so JSON escapes in payload
+        # attributes survive to json.loads (e.g., \n, \t, \" inside '...' quotes).
         pos = start + 4
         in_quote: str | None = None
         while pos < len(text):
             c = text[pos]
             if in_quote:
-                if c == "\\" and pos + 1 < len(text):
+                if c == "\\" and pos + 1 < len(text) and text[pos + 1] == in_quote:
+                    # \ specifically escaping the outer quote — consume both
                     pos += 2
                     continue
                 if c == in_quote:
@@ -288,28 +316,43 @@ def _find_bus_tags(text: str) -> list[tuple[int, int, dict[str, str]]]:
                         attrs = _parse_attrs(inner)
                         results.append((start, pos + 2, attrs))
                     except ValueError as e:
-                        # Malformed tag — audit at scan time, do NOT publish
-                        _bus.audit({"dir": "drop", "reason": "outbound_tag_malformed",
-                                    "error": str(e), "raw": text[start:pos + 2][:200]})
+                        _bus.audit({
+                            "dir": "drop",
+                            "reason": "codex_adapter_outbound_tag_malformed",
+                            "error": str(e),
+                            "raw": text[start:pos + 2][:200],
+                            **context,  # subject, req_id from caller
+                        })
                     i = pos + 2
                     break
                 if c == "<":
-                    # New tag started without our tag closing — malformed
-                    _bus.audit({"dir": "drop", "reason": "outbound_tag_unclosed",
-                                "raw": text[start:start + 200]})
+                    _bus.audit({
+                        "dir": "drop",
+                        "reason": "codex_adapter_outbound_tag_unclosed",
+                        "raw": text[start:start + 200],
+                        **context,
+                    })
                     i = start + 4
                     break
                 pos += 1
         else:
-            # Ran off end of text without closing
-            _bus.audit({"dir": "drop", "reason": "outbound_tag_unclosed",
-                        "raw": text[start:start + 200]})
+            _bus.audit({
+                "dir": "drop",
+                "reason": "codex_adapter_outbound_tag_unclosed",
+                "raw": text[start:start + 200],
+                **context,
+            })
             return results
 
 def _parse_attrs(inner: str) -> dict[str, str]:
     """Parse `key="value" key='value'` pairs from tag inner. Handles both
-    quote styles, backslash escapes inside quotes, XML entity references
-    (&amp; &lt; &gt; &quot; &apos;)."""
+    quote styles.
+
+    v4 Codex #1: only unescape \\<outer_quote>. Every other backslash is
+    preserved so JSON escapes inside `payload='...'` survive to
+    json.loads. So `payload='{"text":"a\\nb"}'` yields the JSON string
+    `{"text":"a\\nb"}` unchanged, and `json.loads` correctly interprets
+    the `\\n` as a newline."""
     attrs = {}
     pos = 0
     n = len(inner)
@@ -332,10 +375,12 @@ def _parse_attrs(inner: str) -> dict[str, str]:
             raise ValueError(f"expected quoted value for {key!r}")
         quote = inner[pos]
         pos += 1
-        val_start = pos
         val_chars = []
         while pos < n and inner[pos] != quote:
-            if inner[pos] == "\\" and pos + 1 < n:
+            if inner[pos] == "\\" and pos + 1 < n and inner[pos + 1] == quote:
+                # Backslash escaping the outer quote — consume the backslash,
+                # emit the quote char. Any OTHER backslash (\n, \t, \\, etc)
+                # passes through unchanged so json.loads sees it verbatim.
                 val_chars.append(inner[pos + 1])
                 pos += 2
             else:
@@ -345,7 +390,11 @@ def _parse_attrs(inner: str) -> dict[str, str]:
             raise ValueError(f"unclosed quote for {key!r}")
         pos += 1  # skip closing quote
         raw_value = "".join(val_chars)
-        # Unescape XML entities
+        # Unescape XML entities (applied AFTER backslash handling, so &amp; in
+        # a JSON string survives to json.loads as &amp; which then decodes... wait,
+        # no: XML entities are the outer wrapper's escape mechanism, not JSON's.
+        # If a caller wrote &lt; in an attribute, they meant a literal < in the
+        # attribute value, then downstream (e.g., json.loads on payload) sees <.)
         for entity, char in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
                              ("&quot;", '"'), ("&apos;", "'")):
             raw_value = raw_value.replace(entity, char)
@@ -375,7 +424,9 @@ async def _process_bus_tags(
 ) -> tuple[str, list[str]]:
     """Extract <BUS ... /> tags, publish each async with per-tag failure isolation.
     Returns (text-with-tags-removed, per-tag human-readable notes)."""
-    tags = _find_bus_tags(text)
+    # v4 Ohm #3: parser-generated drops carry the same context outbound audits do
+    context = {"subject": subject_context, "req_id": req_id}
+    tags = _find_bus_tags(text, context=context)
     if not tags:
         return text, []
 
@@ -386,9 +437,11 @@ async def _process_bus_tags(
             payload = json.loads(attrs.get("payload", "{}"))
         except json.JSONDecodeError as e:
             notes.append(f"[bus tag ignored: payload JSON invalid: {e}]")
-            _bus.audit({"dir": "drop", "subject": subject_context,
-                        "reason": "outbound_tag_payload_json_invalid",
-                        "raw": attrs.get("payload", "")[:200]})
+            _bus.audit({
+                "dir": "drop", "subject": subject_context,
+                "reason": "codex_adapter_outbound_tag_payload_json_invalid",
+                "raw": attrs.get("payload", "")[:200], "req_id": req_id,
+            })
             continue
 
         env = {
@@ -407,9 +460,13 @@ async def _process_bus_tags(
         elif in_reply_to:
             env["in_reply_to"] = in_reply_to
 
-        # Baton additive-field pass-through (Ohm v2 #3). The model can set
-        # these on the outbound tag; we preserve them without imposing
-        # semantics (SPEC §14 — baton lifecycle is not in this adapter's scope).
+        # Baton additive-field pass-through. The model can set these on
+        # the outbound tag; we preserve them without imposing semantics.
+        #
+        # v4 Codex #2 / Ohm #1: invalid hops MUST skip the whole tag,
+        # not just the inner baton loop. Use a per-tag sentinel; continue
+        # the outer tag loop on any baton parse failure.
+        baton_invalid = False
         for baton_field in BATON_FIELDS:
             if baton_field in attrs:
                 if baton_field == "hops":
@@ -417,37 +474,50 @@ async def _process_bus_tags(
                         env["hops"] = int(attrs["hops"])
                     except ValueError:
                         notes.append(f"[bus tag ignored: hops not integer]")
-                        _bus.audit({"dir": "drop", "subject": subject_context,
-                                    "reason": "outbound_baton_hops_not_integer"})
-                        continue
+                        _bus.audit({
+                            "dir": "drop", "subject": subject_context,
+                            "reason": "codex_adapter_outbound_baton_hops_not_integer",
+                            "req_id": req_id,
+                        })
+                        baton_invalid = True
+                        break
                 else:
                     env[baton_field] = attrs[baton_field]
+        if baton_invalid:
+            continue  # skip the whole tag
 
         validation = _bus.validate_outbound(env)  # applies SPEC §5 reject codes
         if not validation["ok"]:
             notes.append(f"[bus tag ignored: {validation['error']}]")
-            _bus.audit({"dir": "drop", "subject": subject_context,
-                        "reason": validation["error"], "envelope_id": env["id"],
-                        "req_id": req_id})
+            # SPEC §5 codes are unprefixed — this is the standardized taxonomy
+            _bus.audit({
+                "dir": "drop", "subject": subject_context,
+                "reason": validation["error"], "envelope_id": env["id"],
+                "req_id": req_id,
+            })
             continue
 
         subject = _pick_publish_subject(env)
 
         try:
             await _bus.publish(subject, env)
-            # Codex finding #5: outbound audits MUST include req_id (SPEC §8)
-            _bus.audit({"dir": "out", "subject": subject,
-                        "envelope_id": env["id"], "req_id": req_id})
+            # SPEC §8: outbound audit MUST include envelope_id + req_id
+            _bus.audit({
+                "dir": "out", "subject": subject,
+                "envelope_id": env["id"], "req_id": req_id,
+            })
             notes.append(
                 f"→ bus: {env['from']}→{env.get('to') or 'broadcast'} "
                 f"{env['kind']} ({env['id'][:8]}) via {subject}"
             )
         except Exception as e:
             notes.append(f"[bus publish failed: {e}]")
-            _bus.audit({"dir": "drop", "subject": subject,
-                        "reason": "publish_error",
-                        "envelope_id": env["id"], "req_id": req_id,
-                        "error": str(e)})
+            _bus.audit({
+                "dir": "drop", "subject": subject,
+                "reason": "codex_adapter_publish_error",
+                "envelope_id": env["id"], "req_id": req_id,
+                "error": str(e),
+            })
             # Do NOT re-raise: one failed tag must not abort the batch.
 
     # Rebuild text without the tags
