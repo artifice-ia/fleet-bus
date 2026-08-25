@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/artifice-ia/fleet-bus/schema/envelope.v1.schema.json",
+  "title": "fleet-bus envelope v1",
+  "description": "Wire envelope schema for the Artifice fleet-bus. Additive-only within v1: consumers MUST ignore unknown fields. Bump envelope_version to 2 only for breaking changes. See SPEC.md clause 1.",
+  "type": "object",
+  "required": ["envelope_version", "id", "from", "kind", "ts", "payload"],
+  "additionalProperties": true,
+  "properties": {
+    "envelope_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "MUST be 1. On mismatch, consumers reject with `unsupported_envelope_version`."
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique per publish. UUIDv4 recommended. Correlates with audit log."
+    },
+    "from": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+$",
+      "description": "Canonical fleet bot name — allowlist-checked against fleet-manifest.yaml bot_names. Not cryptographically bound to authenticated NATS user (see SPEC.md §4)."
+    },
+    "to": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z0-9_-]+$",
+      "description": "Direct recipient. Null or absent = broadcast (subject determines audience). Direct-request receivers reject on mismatch."
+    },
+    "kind": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Envelope semantic type. Standard: text_message, pr_review_request, pr_review_result, status_ping, status_heartbeat, baton.*. Unknown kinds are logged, not rejected."
+    },
+    "in_reply_to": {
+      "type": "string",
+      "minLength": 1,
+      "description": "envelope.id of the message being answered. One hop back. For multi-hop trace, use baton root_id."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp of publish."
+    },
+    "payload": {
+      "description": "Arbitrary JSON. Semantic per `kind`. Encoded envelope MUST fit within maxBytes (default 1_044_480)."
+    },
+
+    "root_id": {
+      "type": "string",
+      "description": "Baton extension (v1.x additive) — chain identity, copied through descendants. Consumers without baton support MUST ignore per SPEC.md clause 1."
+    },
+    "origin": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+$",
+      "description": "Baton extension (v1.x additive) — bot that started the chain. Completion frames address `origin`, not up in_reply_to."
+    },
+    "owner": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+$",
+      "description": "Baton extension (v1.x additive) — current baton holder. Changes on baton.handoff."
+    },
+    "hops": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Baton extension (v1.x additive) — chain length counter. Warn at 8 (send warning to origin), reject at 16."
+    }
+  }
+}
