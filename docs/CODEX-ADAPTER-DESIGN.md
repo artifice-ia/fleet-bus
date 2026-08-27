@@ -506,6 +506,33 @@ BATON_FIELDS = {"root_id", "origin", "owner", "hops"}
 _BOT_NAME_RE = re.compile(r"[a-z0-9_-]+")
 _NATS_SUBJECT_KIND_RE = re.compile(r"[a-z0-9_-]+(\.[a-z0-9_-]+)*")
 
+def _derive_baton_fields(env: dict, inbound: dict | None) -> dict:
+    """The single adapter-owned writer for every outbound baton field."""
+    if inbound is None:
+        fields = {
+            "root_id": env["id"], "origin": IDENTITY_NAME,
+            "owner": IDENTITY_NAME, "hops": 0,
+        }
+    else:
+        # Missing optional baton metadata cannot create an uncounted path.
+        # Derive it from validated core envelope fields and start counting.
+        fields = {
+            "root_id": inbound["root_id"] if "root_id" in inbound else inbound["id"],
+            "origin": inbound["origin"] if "origin" in inbound else inbound["from"],
+            "owner": inbound["owner"] if "owner" in inbound else inbound["from"],
+            "hops": inbound.get("hops", 0) + 1,
+        }
+    if fields["hops"] >= 16:
+        raise BatonDerivationError("codex_adapter_baton_hops_exhausted")
+    if env["kind"] == "baton.handoff":
+        recipient = normalize_bot_name(env.get("to"))
+        if recipient is None:
+            raise BatonDerivationError(
+                "codex_adapter_baton_handoff_recipient_invalid"
+            )
+        fields["owner"] = recipient
+    return fields
+
 def _pick_publish_subject(env: dict) -> str:
     """SPEC §6: replies go to fleet.<to>.result, requests go to fleet.<to>.request.
     Broadcasts (no `to`) go to fleet.broadcast.<kind>.
@@ -625,40 +652,16 @@ async def _process_bus_tags(
             })
             continue
 
-        if baton_context is None:
-            # Discord-originated chain: mint protocol metadata in trusted
-            # adapter code. The first envelope ID is also the chain root.
-            env.update({
-                "root_id": env["id"], "origin": IDENTITY_NAME,
-                "owner": IDENTITY_NAME, "hops": 0,
+        try:
+            # All four paths (Discord/bus × handoff/other) use this one writer.
+            env.update(_derive_baton_fields(env, baton_context))
+        except BatonDerivationError as e:
+            bus.audit({
+                "dir": "drop", "subject": subject_context,
+                "reason": e.reason, "envelope_id": env["id"],
+                "req_id": req_id,
             })
-        else:
-            # Bus-triggered publish: inherit identity metadata unchanged and
-            # increment the validated inbound hop count in trusted code.
-            for field in ("root_id", "origin", "owner"):
-                if field in baton_context:
-                    env[field] = baton_context[field]
-            if "hops" in baton_context:
-                env["hops"] = baton_context["hops"] + 1
-                if env["hops"] >= 16:
-                    bus.audit({
-                        "dir": "drop", "subject": subject_context,
-                        "reason": "codex_adapter_baton_hops_exhausted",
-                        "envelope_id": env["id"], "req_id": req_id,
-                    })
-                    continue
-            if env["kind"] == "baton.handoff":
-                recipient = normalize_bot_name(env.get("to"))
-                if recipient is None:
-                    bus.audit({
-                        "dir": "drop", "subject": subject_context,
-                        "reason": "codex_adapter_baton_handoff_recipient_invalid",
-                        "envelope_id": env["id"], "req_id": req_id,
-                    })
-                    continue
-                # A handoff transfers ownership to its direct recipient;
-                # every other kind inherits owner unchanged.
-                env["owner"] = recipient
+            continue
 
         validation = bus.validate_outbound(env)  # applies SPEC §5 reject codes
         if not validation["ok"]:
@@ -734,7 +737,7 @@ async def _process_bus_tags(
 | §2 | to optional, string or null | Reject with `invalid_to` if present and not string/null |
 | §2 | in_reply_to optional, string | Reject with `invalid_in_reply_to` if present and not string |
 | §2 | Envelope ≤ 1,044,480 bytes encoded | Reject with `envelope_too_large`; enforce before publish (outbound) and on receive (inbound) |
-| §2 baton additive | root_id/origin/owner/hops accepted, not required | Visible on inbound; outbound identity fields inherit from the validated inbound envelope, except `baton.handoff` derives owner from its direct recipient. Hops increments and is ceiling-checked before publish. Model-written baton tag attributes reject. |
+| §2 baton additive | root_id/origin/owner/hops accepted, not required | Present inbound values are strictly schema-validated before model dispatch. One adapter-owned derivation function covers Discord/bus and handoff/other: missing values derive from validated core fields, handoff owner derives from recipient, and hops always exists and is ceiling-checked. Model-written baton tag attributes reject. |
 | §4 | from normalized (NFKC, lowercase, `[a-z0-9_-]+`) | Apply normalization then match against manifest allowlist; reject with `from_claim_rejected` |
 | §4 | Manifest allowlist load | Load `~/vault/infra/fleet-manifest.yaml` at connect; refuse to start if missing/empty |
 | §5 | Reject codes exact spelling | Use the exact strings from §5 in every audit event `reason` field |
