@@ -1126,17 +1126,20 @@ export class FleetBus {
    * can carry their `note` field without producing a duplicate audit entry
    * (P2 round 3).
    *
-   * DOES persist the full payload as a `dir: meta` audit line WHEN the
-   * standard 8KB body cap would truncate — the injection frame's marker
+   * DOES persist the full payload as a `dir: out` audit line WHEN the
+   * standard 8KB body cap would truncate — from FleetBus's perspective the
+   * frame is outbound to the session. The injection frame's marker
    * (`[...full envelope in audit log env_id=<id>]`) is only a truthful
    * promise if the full envelope is actually somewhere in the audit log
-   * (P2 round 4).
+   * (P2 round 4). Uses `dir: 'out'` per SPEC §8's audit-dir schema
+   * (`in|out|drop`); the distinctive `reason` field distinguishes this
+   * from NATS-outbound publishes (P2 round 6).
    */
   private async injectIntoSession(event: FleetBusSessionEvent): Promise<void> {
     const { truncated } = buildFleetBusFramePayloadBody(event.envelope)
     if (truncated) {
       this.recordAudit({
-        dir: 'meta',
+        dir: 'out',
         reason: 'claude_discord_adapter_payload_body_truncated',
         envelope_id: event.envelope.id,
         req_id: event.reqId,

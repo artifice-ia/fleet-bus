@@ -917,7 +917,9 @@ describe('request / publishReply / onResult', () => {
     const entries = readAudit(auditLogPath)
     const meta = entries.find(e => e.reason === 'claude_discord_adapter_payload_body_truncated')
     expect(meta).toBeDefined()
-    expect(meta!.dir).toBe('meta')
+    // Per SPEC §8 audit-dir schema (in|out|drop); the frame is outbound from
+    // FleetBus to the session, so 'out' with a distinctive reason (P2 round 6).
+    expect(meta!.dir).toBe('out')
     expect(meta!.envelope_id).toBe('wire-trunc-1')
     expect(typeof meta!.req_id).toBe('string')
     // The marker in the frame promises `env_id=<id>`; verify the persisted
@@ -930,7 +932,7 @@ describe('request / publishReply / onResult', () => {
     expect(frame).toContain('env_id=wire-trunc-1')
   })
 
-  test('body-cap NON-truncation writes NO meta audit line', async () => {
+  test('body-cap NON-truncation writes NO truncation audit line', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
     const auditLogPath = join(dir, 'fleet-bus.jsonl')
     const events: FleetBusSessionEvent[] = []
@@ -942,6 +944,23 @@ describe('request / publishReply / onResult', () => {
     expect(events).toHaveLength(1)
     const meta = readAudit(auditLogPath).find(e => e.reason === 'claude_discord_adapter_payload_body_truncated')
     expect(meta).toBeUndefined()
+  })
+
+  test('truncation audit dir is within SPEC §8 schema (in|out|drop)', async () => {
+    // Mutation witness for the round-6 fix — any dir OUTSIDE the schema
+    // (e.g. 'meta', 'info') would land this envelope in a set no schema
+    // consumer expects.
+    const rawPayload = { blob: '&'.repeat(3_000) }
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      injectIntoSession: async () => {},
+    }, allowlist)
+    await bus.handleRequest(envelope({ from: 'ohm', id: 'wire-trunc-2', payload: rawPayload }))
+    const meta = readAudit(auditLogPath).find(e => e.reason === 'claude_discord_adapter_payload_body_truncated')
+    expect(meta).toBeDefined()
+    expect(['in', 'out', 'drop']).toContain(meta!.dir)
   })
 })
 
