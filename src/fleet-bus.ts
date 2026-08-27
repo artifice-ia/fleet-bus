@@ -976,15 +976,25 @@ export class FleetBus {
     }
     const envelope = validation.envelope
     const canonicalBot = normalizeBotName(this.config.botName)
-    const canonicalTo = envelope.to === null || envelope.to === undefined ? null : normalizeBotName(envelope.to)
-    if (canonicalTo !== null && canonicalTo !== canonicalBot) {
-      this.recordAudit({
-        dir: 'drop',
-        subject,
-        reason: 'claude_discord_adapter_misrouted_reply',
-        envelope_id: envelope.id,
-      })
-      return
+    // Preserve the raw-null distinction (Ohm round-7 P1). A legitimate
+    // broadcast reply has `to == null` (loose equality: null or undefined) and
+    // is allowed through. Any *present* non-null recipient MUST canonicalize to
+    // this bot; otherwise it is either misrouted or an invalid recipient
+    // string, both of which drop as misrouted_reply. Do NOT collapse null and
+    // an invalid `normalizeBotName()` return into the same "recipient absent"
+    // branch — that lets `.result` frames with `to: "not.a.bot"` slip past the
+    // gate and resolve waiters in the outbound ledger.
+    if (envelope.to != null) {
+      const canonicalTo = normalizeBotName(envelope.to)
+      if (canonicalTo !== canonicalBot) {
+        this.recordAudit({
+          dir: 'drop',
+          subject,
+          reason: 'claude_discord_adapter_misrouted_reply',
+          envelope_id: envelope.id,
+        })
+        return
+      }
     }
     if (!this.rateLimiters.perFrom.allow(envelope.from)) {
       this.recordAudit({

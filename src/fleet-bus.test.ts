@@ -567,10 +567,15 @@ describe('frame escaping and caps', () => {
 /* request() + publishReply() + onResult                                       */
 /* -------------------------------------------------------------------------- */
 
-function readAudit(path: string): Array<Record<string, unknown>> {
+// Audit entries share a stable shape at the fields we assert on
+// (`dir` + `reason`); anything else stays `unknown` so a stray typo in a
+// consumer test still tsc-fails. Narrowing `dir` closes Ohm round-7 P2 —
+// `toContain(['in', 'out', 'drop'], meta.dir)` needs an assignable string.
+type AuditEntry = { dir: 'in' | 'out' | 'drop'; reason?: string } & Record<string, unknown>
+function readAudit(path: string): AuditEntry[] {
   const text = readFileSync(path, 'utf8').trim()
   if (!text) return []
-  return text.split('\n').map(line => JSON.parse(line))
+  return text.split('\n').map(line => JSON.parse(line) as AuditEntry)
 }
 
 describe('request / publishReply / onResult', () => {
@@ -982,6 +987,82 @@ describe('onResult inject path', () => {
     await bus.handleResult(reply)
     expect(events).toHaveLength(0)
     expect(readAudit(auditLogPath).some(e => e.reason === 'claude_discord_adapter_misrouted_reply')).toBe(true)
+  })
+
+  // Ohm round-7 P1 regression: an invalid (non-null) `to` must NOT collapse
+  // into the "broadcast recipient" branch of the misrouted_reply gate. The
+  // parametrized cases below exercise every shape `normalizeBotName()` returns
+  // null for: not-a-canonical string, empty string, and the reserved
+  // `broadcast` name. Each one MUST audit misrouted_reply and MUST NOT resolve
+  // the outstanding waiter, even though there is a matching ledger entry.
+  for (const [label, badTo] of [
+    ['dotted non-canonical string', 'not.a.bot'],
+    ['empty string', ''],
+    ['reserved broadcast name', 'broadcast'],
+  ] as const) {
+    test(`invalid recipient (${label}) with ledger match audits misrouted_reply and does NOT resolve waiter`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+      const auditLogPath = join(dir, 'fleet-bus.jsonl')
+      const nc = new FakeNatsConnection()
+      const events: FleetBusSessionEvent[] = []
+      const bus = new TestFleetBus({
+        botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+        injectIntoSession: async event => { events.push(event) },
+      }, allowlist)
+      bus.attachFakeNc(nc)
+
+      const promise = bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 5_000 })
+      await Promise.resolve()
+      const publishedEnv = nc.publishes[0]!.envelope as Envelope
+
+      let resolved = false
+      void promise.then(() => { resolved = true })
+
+      // `to: badTo` — from claim is legitimate (kat matches ledger's
+      // expectedFrom) so the ONLY thing standing between this frame and the
+      // waiter is the recipient gate.
+      const reply = {
+        envelope_version: 1, id: 'r-p1-bad', from: 'kat', to: badTo,
+        kind: 'result', in_reply_to: publishedEnv.id,
+        ts: '2026-08-27T00:00:00.000Z', payload: {},
+      }
+      await bus.handleResult(reply)
+      // Waiter MUST NOT resolve.
+      await Promise.resolve()
+      expect(resolved).toBe(false)
+      // No session inject either — dropped before rate-limit / ledger stages.
+      expect(events).toHaveLength(0)
+      // Audit MUST tag misrouted_reply.
+      expect(readAudit(auditLogPath).some(e => e.reason === 'claude_discord_adapter_misrouted_reply')).toBe(true)
+    })
+  }
+
+  // Mutation-witness for the round-7 fix (feedback_mutation_test_the_controls):
+  // if a future change accidentally re-collapses "invalid recipient" and "null
+  // recipient" into the same drop branch (e.g. by dropping any `to != self`),
+  // this test fails — a legitimate broadcast reply MUST still resolve a
+  // matching ledger waiter.
+  test('broadcast reply (to: null) with ledger match resolves the waiter', async () => {
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async () => {},
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    const promise = bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 5_000 })
+    await Promise.resolve()
+    const publishedEnv = nc.publishes[0]!.envelope as Envelope
+
+    const reply = {
+      envelope_version: 1, id: 'r-p1-broadcast', from: 'kat', to: null,
+      kind: 'result', in_reply_to: publishedEnv.id,
+      ts: '2026-08-27T00:00:00.000Z', payload: {},
+    }
+    await bus.handleResult(reply)
+    const outcome = await promise
+    expect(outcome.ok).toBe(true)
+    if (outcome.ok) expect(outcome.reply?.id).toBe('r-p1-broadcast')
   })
 
   test('from mismatch audits reply_from_mismatch, injects as unsolicited, does not resolve waiter', async () => {
