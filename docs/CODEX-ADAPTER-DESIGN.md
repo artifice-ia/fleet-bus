@@ -640,6 +640,25 @@ async def _process_bus_tags(
                     env[field] = baton_context[field]
             if "hops" in baton_context:
                 env["hops"] = baton_context["hops"] + 1
+                if env["hops"] >= 16:
+                    bus.audit({
+                        "dir": "drop", "subject": subject_context,
+                        "reason": "codex_adapter_baton_hops_exhausted",
+                        "envelope_id": env["id"], "req_id": req_id,
+                    })
+                    continue
+            if env["kind"] == "baton.handoff":
+                recipient = normalize_bot_name(env.get("to"))
+                if recipient is None:
+                    bus.audit({
+                        "dir": "drop", "subject": subject_context,
+                        "reason": "codex_adapter_baton_handoff_recipient_invalid",
+                        "envelope_id": env["id"], "req_id": req_id,
+                    })
+                    continue
+                # A handoff transfers ownership to its direct recipient;
+                # every other kind inherits owner unchanged.
+                env["owner"] = recipient
 
         validation = bus.validate_outbound(env)  # applies SPEC §5 reject codes
         if not validation["ok"]:
@@ -715,7 +734,7 @@ async def _process_bus_tags(
 | §2 | to optional, string or null | Reject with `invalid_to` if present and not string/null |
 | §2 | in_reply_to optional, string | Reject with `invalid_in_reply_to` if present and not string |
 | §2 | Envelope ≤ 1,044,480 bytes encoded | Reject with `envelope_too_large`; enforce before publish (outbound) and on receive (inbound) |
-| §2 baton additive | root_id/origin/owner/hops accepted, not required | Visible on inbound; outbound identity fields inherit from the validated inbound envelope and hops increments in adapter code. Model-written baton tag attributes reject. |
+| §2 baton additive | root_id/origin/owner/hops accepted, not required | Visible on inbound; outbound identity fields inherit from the validated inbound envelope, except `baton.handoff` derives owner from its direct recipient. Hops increments and is ceiling-checked before publish. Model-written baton tag attributes reject. |
 | §4 | from normalized (NFKC, lowercase, `[a-z0-9_-]+`) | Apply normalization then match against manifest allowlist; reject with `from_claim_rejected` |
 | §4 | Manifest allowlist load | Load `~/vault/infra/fleet-manifest.yaml` at connect; refuse to start if missing/empty |
 | §5 | Reject codes exact spelling | Use the exact strings from §5 in every audit event `reason` field |
