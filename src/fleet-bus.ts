@@ -194,18 +194,22 @@ class PayloadNotSerializableError extends Error {
 
 /**
  * Return true if `payload` will round-trip through `JSON.stringify` with no
- * fields silently disappearing. Rejects:
+ * fields silently disappearing OR silently morphing into `null`. Rejects:
  * - top-level `undefined` (JSON.stringify short-circuits without invoking the replacer)
- * - top-level `function` / `symbol` (same short-circuit path)
+ * - top-level `function` / `symbol` / `bigint` (same short-circuit path)
  * - ANY nested `undefined` / `function` / `symbol` / `bigint` (would be dropped from
  *   the encoded envelope; `{ok: true, data: undefined}` becomes `{"ok":true}` and
  *   the receiver's expectation quietly diverges from what the sender thinks it sent)
+ * - ANY `NaN` / `Infinity` / `-Infinity` at any depth (JSON.stringify silently
+ *   coerces these to `null` on the wire — a "42 becomes null" bug is worse than
+ *   a clean reject at the send-side boundary)
  * - anything with a hostile `toJSON` that throws
  */
 export function payloadIsJsonSerializable(payload: unknown): boolean {
   if (payload === undefined) return false
   const rootKind = typeof payload
   if (rootKind === 'function' || rootKind === 'symbol' || rootKind === 'bigint') return false
+  if (rootKind === 'number' && !Number.isFinite(payload as number)) return false
   try {
     JSON.stringify(payload, (_key, value) => {
       if (
@@ -214,6 +218,9 @@ export function payloadIsJsonSerializable(payload: unknown): boolean {
         typeof value === 'symbol' ||
         typeof value === 'bigint'
       ) {
+        throw new PayloadNotSerializableError()
+      }
+      if (typeof value === 'number' && !Number.isFinite(value)) {
         throw new PayloadNotSerializableError()
       }
       return value
@@ -587,6 +594,9 @@ class BoundedLru<K, V> {
 interface InflightEntry {
   envelope: Envelope
   expectedFrom: string
+  /** Local publish-side req_id — preserved so the matched-reply audit can
+   * correlate the reply back to the original request in the log. */
+  reqId: string
   resolve: (result: FleetBusRequestResult) => void
   timerId: ReturnType<typeof setTimeout>
 }
@@ -818,6 +828,7 @@ export class FleetBus {
       this.outboundLedger.set(envelopeId, {
         envelope,
         expectedFrom: canonicalTo,
+        reqId: localReqId,
         resolve,
         timerId,
       })
@@ -934,8 +945,10 @@ export class FleetBus {
 
     const reqId = randomBytes(16).toString('hex')
     this.receiveLedger.set(reqId, result.envelope)
+    // Single dir:in audit per received envelope (dedup fix, round-3 P2).
+    this.recordAudit({ dir: 'in', subject, envelope_id: result.envelope.id, req_id: reqId })
     await this.injectIntoSession({ envelope: result.envelope, reqId }).catch(error => {
-      this.recordAudit({ dir: 'drop', subject, reason: 'injection_failed', error: String(error) })
+      this.recordAudit({ dir: 'drop', subject, reason: 'injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
     })
   }
 
@@ -990,10 +1003,15 @@ export class FleetBus {
         if (envelope.from === match.expectedFrom) {
           // Ledger-matched .result: resolve the outstanding waiter and BYPASS
           // perSessionInject — this resolves an already-running tool call
-          // rather than initiating a new session turn (P2-5).
+          // rather than initiating a new session turn (P2-5). Preserve the
+          // ORIGINAL request's req_id on the audit line so log correlation
+          // (reply-to-request) survives.
           clearTimeout(match.timerId)
           this.outboundLedger.delete(inReplyTo)
-          this.recordAudit({ dir: 'in', subject, envelope_id: envelope.id, note: 'ledger_matched' })
+          this.recordAudit({
+            dir: 'in', subject, envelope_id: envelope.id,
+            req_id: match.reqId, note: 'ledger_matched',
+          })
           match.resolve({ ok: true, envelope: match.envelope, delivered_to_subscriber: true, reply: envelope })
           return
         }
@@ -1004,6 +1022,7 @@ export class FleetBus {
           subject,
           reason: 'reply_from_mismatch',
           envelope_id: envelope.id,
+          req_id: match.reqId,
           expected_from: match.expectedFrom,
         })
         await this.injectUnsolicited(subject, envelope)
@@ -1039,7 +1058,7 @@ export class FleetBus {
       ...(lateReplyEnvId !== undefined ? { late_reply_env_id: lateReplyEnvId } : {}),
     })
     await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId }).catch(error => {
-      this.recordAudit({ dir: 'drop', subject, reason: 'injection_failed', error: String(error) })
+      this.recordAudit({ dir: 'drop', subject, reason: 'injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
     })
   }
 
@@ -1061,6 +1080,7 @@ export class FleetBus {
       subject: `fleet.${entry.envelope.to}.request`,
       reason: 'ledger_overflow',
       envelope_id: entry.envelope.id,
+      req_id: entry.reqId,
     })
     entry.resolve({ ok: false, error: 'ledger_overflow', envelope: entry.envelope })
   }
@@ -1099,13 +1119,18 @@ export class FleetBus {
     }
   }
 
+  /**
+   * Dispatch the envelope to the session callback. Deliberately does NOT
+   * audit here — every caller writes exactly one `dir: in` audit BEFORE
+   * calling this method, so unsolicited/late replies can carry their
+   * `note` field without producing a duplicate audit entry (P2 round 3).
+   */
   private async injectIntoSession(event: FleetBusSessionEvent): Promise<void> {
     if (!this.config.injectIntoSession) {
       this.log(`received ${event.envelope.kind} from ${event.envelope.from}; session injection is not configured`)
       return
     }
     await this.config.injectIntoSession(event)
-    this.recordAudit({ dir: 'in', envelope: event.envelope, req_id: event.reqId })
   }
 
   private recordAudit(entry: Record<string, unknown>): void {

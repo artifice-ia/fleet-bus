@@ -710,11 +710,17 @@ describe('request / publishReply / onResult', () => {
     ['top-level function', () => { /* noop */ }],
     ['top-level symbol', Symbol('x')],
     ['top-level bigint', BigInt(1)],
+    ['top-level NaN', Number.NaN],
+    ['top-level Infinity', Number.POSITIVE_INFINITY],
+    ['top-level -Infinity', Number.NEGATIVE_INFINITY],
     ['nested undefined', { ok: true, data: undefined }],
     ['deeply nested undefined', { a: { b: { c: undefined } } }],
     ['nested function', { ok: true, cb: () => 1 }],
     ['nested symbol', { ok: true, s: Symbol('nested') }],
     ['nested bigint', { ok: true, n: BigInt(42) }],
+    ['nested NaN', { ok: true, score: Number.NaN }],
+    ['nested Infinity', { ok: true, limit: Number.POSITIVE_INFINITY }],
+    ['NaN inside array', [1, Number.NaN, 3]],
     ['undefined inside array', [1, undefined, 3]],
   ])('request() rejects payload that disappears in JSON encoding — %s', async (_label, payload) => {
     const nc = new FakeNatsConnection()
@@ -794,6 +800,103 @@ describe('request / publishReply / onResult', () => {
     // Only the wait:true + reply-received path may claim delivery.
     expect(result.delivered_to_subscriber).toBe(true)
     expect(result.reply?.id).toBe('reply-uuid-2')
+  })
+
+  test('matched-reply audit preserves the ORIGINAL request req_id (log correlation)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const promise = bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 5_000 })
+    await Promise.resolve()
+    const publishedEnv = nc.publishes[0]!.envelope as Envelope
+    // Grab the request's outbound audit — that's the req_id we expect the
+    // matching reply's inbound audit to carry.
+    const outEntry = readAudit(auditLogPath).find(e => e.dir === 'out')
+    expect(outEntry).toBeDefined()
+    const requestReqId = outEntry!.req_id as string
+    expect(typeof requestReqId).toBe('string')
+
+    const reply = {
+      envelope_version: 1, id: 'reply-uuid-3', from: 'kat', to: 'vec',
+      kind: 'result', in_reply_to: publishedEnv.id,
+      ts: '2026-08-27T00:00:00.000Z', payload: { done: true },
+    }
+    await bus.handleResult(reply)
+    await promise
+
+    const matchedEntry = readAudit(auditLogPath).find(
+      e => e.dir === 'in' && e.envelope_id === 'reply-uuid-3',
+    )
+    expect(matchedEntry).toBeDefined()
+    expect(matchedEntry!.note).toBe('ledger_matched')
+    // THIS is the round-3 P2: the matched-reply's inbound audit must carry
+    // the original request's req_id so operators can correlate reply-to-request.
+    expect(matchedEntry!.req_id).toBe(requestReqId)
+  })
+
+  test('ledger_overflow drop audit carries the evicted request req_id', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      inflightLedgerCap: 1,
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const p1 = bus.request({ to: 'kat', kind: 'text_message', payload: { i: 1 }, wait: true, timeoutMs: 5_000 })
+    const p2 = bus.request({ to: 'kat', kind: 'text_message', payload: { i: 2 }, wait: true, timeoutMs: 5_000 })
+    void p2.then(() => {}, () => {})
+    const r1 = await p1
+    expect(r1.error).toBe('ledger_overflow')
+    const overflowEntry = readAudit(auditLogPath).find(e => e.reason === 'ledger_overflow')
+    expect(overflowEntry).toBeDefined()
+    expect(typeof overflowEntry!.req_id).toBe('string')
+    expect(overflowEntry!.envelope_id).toBe(r1.envelope!.id)
+  })
+
+  test('successful inject writes exactly ONE dir:in audit per received envelope (round-3 dedup)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    await bus.handleRequest(envelope({ from: 'ohm', id: 'wire-dedup-1' }))
+    expect(events).toHaveLength(1)
+    const inEntries = readAudit(auditLogPath).filter(e => e.dir === 'in' && e.envelope_id === 'wire-dedup-1')
+    // Previously this was 2 (one from the caller, one from injectIntoSession).
+    expect(inEntries).toHaveLength(1)
+  })
+
+  test('unsolicited reply successful inject writes exactly ONE dir:in audit (round-3 dedup)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const nc = new FakeNatsConnection()
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const reply = {
+      envelope_version: 1, id: 'wire-dedup-unsol-1', from: 'kat', to: 'vec',
+      kind: 'result', in_reply_to: 'never-was-in-flight',
+      ts: '2026-08-27T00:00:00.000Z', payload: {},
+    }
+    await bus.handleResult(reply)
+    expect(events).toHaveLength(1)
+    expect(events[0]!.unsolicited).toBe(true)
+    const inEntries = readAudit(auditLogPath).filter(
+      e => e.dir === 'in' && e.envelope_id === 'wire-dedup-unsol-1',
+    )
+    // Exactly ONE audit entry, carrying the unsolicited_reply note.
+    expect(inEntries).toHaveLength(1)
+    expect(inEntries[0]!.note).toBe('unsolicited_reply')
   })
 })
 
