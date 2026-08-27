@@ -148,12 +148,19 @@ describe('envelope validation', () => {
       ['hops NaN', { hops: Number.NaN }, 'claude_discord_adapter_invalid_hops'],
       ['hops float', { hops: 1.5 }, 'claude_discord_adapter_invalid_hops'],
       ['hops string', { hops: '3' }, 'claude_discord_adapter_invalid_hops'],
+      ['hops at ceiling', { hops: 16 }, 'claude_discord_adapter_invalid_hops_ceiling'],
+      ['hops above ceiling', { hops: 100 }, 'claude_discord_adapter_invalid_hops_ceiling'],
     ])('rejects %s', (_label, patch, error) => {
       expect(validateEnvelope(envelope(patch), allowlist)).toEqual({ ok: false, error })
     })
 
     test('hops = 0 is valid', () => {
       const result = validateEnvelope(envelope({ hops: 0 }), allowlist)
+      expect(result.ok).toBe(true)
+    })
+
+    test('hops = 15 is valid (just under ceiling)', () => {
+      const result = validateEnvelope(envelope({ hops: 15 }), allowlist)
       expect(result.ok).toBe(true)
     })
   })
@@ -500,6 +507,33 @@ describe('frame escaping and caps', () => {
     expect(markerIdx).toBeLessThanOrEqual(DEFAULT_PAYLOAD_BODY_MAX_BYTES + 8)
   })
 
+  test('payload body cap is measured POST-escape (5× expansion for `&` payloads)', () => {
+    // 4KB of raw `&` chars → 20KB of escaped `&amp;` output.
+    const rawAmpBytes = 4_096
+    const env = envelope({ id: 'ampersand-1', payload: '&'.repeat(rawAmpBytes) }) as Envelope
+    const { body, truncated } = buildFleetBusFramePayloadBody(env)
+    expect(truncated).toBe(true)
+    // The pre-marker body slice MUST NOT exceed the cap even with the escape expansion.
+    const markerStart = body.indexOf('\n[...truncated')
+    const preMarker = body.slice(0, markerStart)
+    expect(Buffer.byteLength(preMarker, 'utf8')).toBeLessThanOrEqual(DEFAULT_PAYLOAD_BODY_MAX_BYTES)
+    // Trailing chars must be a complete entity (`&amp;`), not a partial one like `&am`.
+    expect(preMarker.endsWith('&amp;') || preMarker.endsWith('"')).toBe(true)
+  })
+
+  test('trims trailing partial XML entity at truncation boundary', () => {
+    // Payload full of `&` — the truncation is deterministic enough to land mid-entity.
+    // Just verify no half-entity leaks: no `&` without matching `;` between it and the marker.
+    const env = envelope({ id: 'amp-2', payload: '&'.repeat(4_096) }) as Envelope
+    const { body } = buildFleetBusFramePayloadBody(env)
+    const preMarker = body.slice(0, body.indexOf('\n[...truncated'))
+    const lastAmp = preMarker.lastIndexOf('&')
+    if (lastAmp !== -1) {
+      const tail = preMarker.slice(lastAmp)
+      expect(tail.includes(';')).toBe(true)
+    }
+  })
+
   test('full frame builds with attribute escape and body cap', () => {
     const env = envelope({ payload: { note: 'hi <them>' } }) as Envelope
     const frame = buildFleetBusFrame({ envelope: env, reqId: 'r-2' })
@@ -666,6 +700,39 @@ describe('request / publishReply / onResult', () => {
     // Baton propagated from inbound (hops=0 inbound → hops=1 reply).
     expect(publishedReply.root_id).toBe('wire-42')
     expect(publishedReply.hops).toBe(1)
+  })
+
+  test.each([
+    ['undefined', undefined],
+    ['function', () => { /* noop */ }],
+    ['symbol', Symbol('x')],
+  ])('request() rejects payload that disappears in JSON encoding — %s', async (_label, payload) => {
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const result = await bus.request({ to: 'kat', kind: 'text_message', payload })
+    expect(result.ok).toBe(false)
+    expect(result.error).toBe('claude_discord_adapter_payload_not_json_serializable')
+    // Nothing hit the wire.
+    expect(nc.publishes).toHaveLength(0)
+  })
+
+  test('publishReply() rejects unencodable payload', async () => {
+    const nc = new FakeNatsConnection()
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    await bus.handleRequest(envelope({ from: 'ohm', id: 'wire-99' }))
+    const reqId = events[0]!.reqId
+    const result = bus.publishReply(reqId, undefined)
+    expect(result.ok).toBe(false)
+    expect(result.error).toBe('claude_discord_adapter_payload_not_json_serializable')
+    expect(nc.publishes).toHaveLength(0)
   })
 })
 
@@ -996,6 +1063,39 @@ describe('supervisor loop', () => {
     await new Promise(r => setTimeout(r, 30))
     await bus.stop()
     await done
+  })
+
+  test('rechecks supervisorStopping after a slow connect resolves', async () => {
+    // Race: stop() fires while connect() is in flight. The supervisor must
+    // recheck stopping BEFORE waitClosed, or it hangs on a fresh connection
+    // the caller thought was torn down.
+    let releaseConnect: (() => void) | null = null
+    const connections: FakeNatsConnection[] = []
+    const bus = new FleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      supervisorSleepMs: 10,
+      connectFn: async () => {
+        const isFirst = connections.length === 0
+        const nc = new FakeNatsConnection()
+        connections.push(nc)
+        if (isFirst) {
+          await new Promise<void>(r => { releaseConnect = r })
+        }
+        return nc as unknown as NatsConnection
+      },
+    }, allowlist)
+    const done = bus.run()
+    // Let connectFn begin blocking.
+    await new Promise(r => setTimeout(r, 10))
+    expect(releaseConnect).not.toBeNull()
+    // Fire stop() while connect() is still in flight.
+    const stopP = bus.stop()
+    // Give stop() a tick to set supervisorStopping = true before we release connect.
+    await Promise.resolve()
+    releaseConnect!()
+    await Promise.all([stopP, done])
+    // Supervisor exited after the first connect returned; no reconnect loop.
+    expect(connections.length).toBe(1)
   })
 })
 

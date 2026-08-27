@@ -186,6 +186,23 @@ export function createHeartbeatEnvelope(
 }
 
 /**
+ * Return true if `payload` will round-trip through `JSON.stringify`.
+ * Rejects top-level `undefined`, functions, and symbols — all of which
+ * `JSON.stringify` silently returns `undefined` for — plus `BigInt` and
+ * anything with a hostile `toJSON` that throws.
+ */
+export function payloadIsJsonSerializable(payload: unknown): boolean {
+  if (payload === undefined) return false
+  const kind = typeof payload
+  if (kind === 'function' || kind === 'symbol') return false
+  try {
+    return JSON.stringify(payload) !== undefined
+  } catch {
+    return false
+  }
+}
+
+/**
  * Validate the v1 wire envelope before it reaches any bus handler.
  * Extended in Stage 3 to enforce baton-value validity on the wire.
  */
@@ -233,6 +250,12 @@ export function validateEnvelope(
     const hops = candidate.hops
     if (!Number.isInteger(hops) || (hops as number) < 0) {
       return { ok: false, error: 'claude_discord_adapter_invalid_hops' }
+    }
+    // The ceiling fires on both derivation (outbound throw) AND inbound wire
+    // validation — otherwise a peer publishing `hops: 100` slips past validate
+    // and is only caught if the local bot tries to derive a further increment.
+    if ((hops as number) >= 16) {
+      return { ok: false, error: 'claude_discord_adapter_invalid_hops_ceiling' }
     }
   }
 
@@ -372,18 +395,38 @@ export function escapeFrameContent(value: unknown, maxLen = DEFAULT_ATTR_MAX_LEN
   return escaped
 }
 
-/** JSON-encode a payload for the frame body with 8KB cap + truncation marker. */
+/**
+ * Trim a trailing partial XML entity (e.g. `...&am` cut mid-entity) back to
+ * the last completed character so the resulting slice is well-formed XML.
+ */
+function trimTrailingPartialEntity(value: string): string {
+  const lastAmp = value.lastIndexOf('&')
+  if (lastAmp === -1) return value
+  const tail = value.slice(lastAmp)
+  if (tail.includes(';')) return value
+  return value.slice(0, lastAmp)
+}
+
+/**
+ * JSON-encode a payload for the frame body with an 8KB cap + truncation
+ * marker. The cap is measured on the ESCAPED output — a payload full of
+ * `& < > " '` expands 1 byte to 5 (`&` → `&amp;`), so measuring raw bytes
+ * could yield a ~5× overrun of the guaranteed injection surface.
+ */
 export function buildFleetBusFramePayloadBody(
   envelope: Envelope,
   maxBytes = DEFAULT_PAYLOAD_BODY_MAX_BYTES,
 ): { body: string; truncated: boolean } {
   const encoded = JSON.stringify(envelope.payload) ?? 'null'
-  const size = Buffer.byteLength(encoded, 'utf8')
-  if (size <= maxBytes) return { body: xmlEscape(encoded), truncated: false }
+  const escaped = xmlEscape(encoded)
+  const escapedSize = Buffer.byteLength(escaped, 'utf8')
+  if (escapedSize <= maxBytes) return { body: escaped, truncated: false }
   // env_id is XML-escaped so a hostile id can't break out of the <payload> tag.
   const marker = `\n[...truncated 8KB max, full envelope in audit log env_id=${xmlEscape(String(envelope.id))}]`
-  const truncated = Buffer.from(encoded, 'utf8').subarray(0, maxBytes).toString('utf8')
-  return { body: xmlEscape(truncated) + marker, truncated: true }
+  const truncatedBytes = Buffer.from(escaped, 'utf8').subarray(0, maxBytes).toString('utf8')
+  // Guard against splitting a multi-byte entity (`&amp;` etc.) at the cap.
+  const safeBody = trimTrailingPartialEntity(truncatedBytes)
+  return { body: safeBody + marker, truncated: true }
 }
 
 export function buildFleetBusFrameMeta(event: FleetBusSessionEvent): FleetBusFrameMeta {
@@ -636,6 +679,13 @@ export class FleetBus {
         await this.sleep(sleepMs)
         continue
       }
+      // Race: stop() may have fired while connect() was in flight. Recheck
+      // BEFORE waitClosed / subscribe traffic so the caller isn't left with
+      // a live connection they thought was torn down.
+      if (this.supervisorStopping) {
+        await this.disconnect().catch(() => {})
+        break
+      }
       await this.waitClosed()
       if (this.supervisorStopping) break
       this.log('supervisor: connection closed, reconnecting after backoff')
@@ -674,6 +724,13 @@ export class FleetBus {
 
     const canonicalTo = normalizeBotName(options.to)
     if (canonicalTo === null) return { ok: false, error: 'invalid_recipient' }
+    if (!payloadIsJsonSerializable(options.payload)) {
+      this.recordAudit({
+        dir: 'drop', subject: `fleet.${canonicalTo}.request`,
+        reason: 'claude_discord_adapter_payload_not_json_serializable',
+      })
+      return { ok: false, error: 'claude_discord_adapter_payload_not_json_serializable' }
+    }
     const canonicalBot = normalizeBotName(this.config.botName)!
     const envelopeId = randomUUID()
     let baton: BatonFields
@@ -745,6 +802,13 @@ export class FleetBus {
     if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'fleet_bus_not_connected', req_id: reqId }
     const inbound = this.receiveLedger.get(reqId)
     if (inbound === undefined) return { ok: false, error: 'req_id_unknown', req_id: reqId }
+    if (!payloadIsJsonSerializable(payload)) {
+      this.recordAudit({
+        dir: 'drop', subject: `fleet.${inbound.from}.result`,
+        reason: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId,
+      })
+      return { ok: false, error: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId }
+    }
     const canonicalBot = normalizeBotName(this.config.botName)!
     const envelopeId = randomUUID()
     let baton: BatonFields
