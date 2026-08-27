@@ -1,10 +1,25 @@
-import { connect as natsConnect, JSONCodec, type NatsConnection, type Msg, type Subscription } from 'nats'
+import {
+  connect as natsConnect,
+  JSONCodec,
+  type ConnectionOptions,
+  type NatsConnection,
+  type Msg,
+  type Subscription,
+} from 'nats'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { appendFileSync, chmodSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { parse as parseYaml } from 'yaml'
 
 export const DEFAULT_MAX_ENVELOPE_BYTES = 1_044_480
+export const DEFAULT_INFLIGHT_LEDGER_CAP = 1000
+export const DEFAULT_RECEIVE_LEDGER_CAP = 1000
+export const DEFAULT_EVICTED_LEDGER_CAP = 1000
+export const DEFAULT_SEEN_RESULT_LEDGER_CAP = 1000
+export const DEFAULT_SEEN_REQUEST_LEDGER_CAP = 1000
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+export const DEFAULT_ATTR_MAX_LEN = 1024
+export const DEFAULT_PAYLOAD_BODY_MAX_BYTES = 8192
 
 export interface Envelope<P = unknown> {
   envelope_version: 1
@@ -15,7 +30,13 @@ export interface Envelope<P = unknown> {
   in_reply_to?: string
   ts: string
   payload: P
+  root_id?: string
+  origin?: string
+  owner?: string
+  hops?: number
 }
+
+export type FleetBusMode = 'primary' | 'publish-only'
 
 export interface FleetBusConfig {
   botName: string
@@ -29,11 +50,28 @@ export interface FleetBusConfig {
   logger?: (message: string) => void
   auditLogPath?: string
   injectIntoSession?: (event: FleetBusSessionEvent) => Promise<void>
+  mode?: FleetBusMode
+  inflightLedgerCap?: number
+  receiveLedgerCap?: number
+  evictedLedgerCap?: number
+  seenResultLedgerCap?: number
+  seenRequestLedgerCap?: number
+  rateLimiters?: FleetBusRateLimiters
+  supervisorSleepMs?: number
+  /**
+   * Injected NATS connect function for testing. Defaults to `nats.connect`.
+   * Signature intentionally loose to match the module's exported type.
+   */
+  connectFn?: (options: ConnectionOptions) => Promise<NatsConnection>
 }
 
 export interface FleetBusSessionEvent {
   envelope: Envelope
   reqId: string
+  /** Set on `.result` envelopes that did not match an outstanding request. */
+  unsolicited?: boolean
+  /** Set when this envelope is a late reply to a request whose waiter was already evicted. */
+  lateReplyEnvId?: string
 }
 
 export interface FleetBusFrameMeta {
@@ -44,18 +82,7 @@ export interface FleetBusFrameMeta {
   req_id: string
   env_id: string
   ts: string
-}
-
-export function buildFleetBusFrameMeta({ envelope, reqId }: FleetBusSessionEvent): FleetBusFrameMeta {
-  return {
-    source: 'fleet-bus',
-    authenticated: 'false',
-    from_claim: envelope.from,
-    kind: envelope.kind,
-    req_id: reqId,
-    env_id: envelope.id,
-    ts: envelope.ts,
-  }
+  late_reply_env_id?: string
 }
 
 export interface TokenBucket {
@@ -75,6 +102,8 @@ export interface FleetBusRequestOptions {
   wait?: boolean
   timeoutMs?: number
   force?: boolean
+  /** Baton lineage source — the inbound envelope currently being answered. Omit for originating requests. */
+  inbound?: Envelope
 }
 
 export interface FleetBusRequestResult {
@@ -82,12 +111,14 @@ export interface FleetBusRequestResult {
   envelope?: Envelope
   delivered_to_subscriber?: boolean
   error?: string
+  reply?: Envelope
+  timed_out?: boolean
 }
 
 export interface FleetBusReplyResult {
   ok: boolean
   envelope?: Envelope
-  error?: 'req_id_unknown' | string
+  error?: 'claude_discord_adapter_req_id_unknown' | 'claude_discord_adapter_multi_instance_publish_only' | string
   req_id?: string
 }
 
@@ -96,12 +127,16 @@ export type EnvelopeValidationResult =
   | { ok: false; error: string }
 
 const BOT_NAME_PATTERN = /^[a-z0-9_-]+$/
+export const BROADCAST_KIND_RE = /^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/
+export const RESERVED_BOT_NAMES = new Set(['broadcast'])
 
-/** Return the canonical bus identity, or null for a non-ASCII/invalid claim. */
+/** Return the canonical bus identity, or null for a non-ASCII/invalid/reserved claim. */
 export function normalizeBotName(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const normalized = value.normalize('NFKC').toLowerCase()
-  return BOT_NAME_PATTERN.test(normalized) ? normalized : null
+  if (!BOT_NAME_PATTERN.test(normalized)) return null
+  if (RESERVED_BOT_NAMES.has(normalized)) return null
+  return normalized
 }
 
 /** Normalize a manifest bot_names list, rejecting invalid entries. */
@@ -154,7 +189,56 @@ export function createHeartbeatEnvelope(
   }
 }
 
-/** Validate the v1 wire envelope before it reaches any bus handler. */
+class PayloadNotSerializableError extends Error {
+  constructor(message = 'payload contains an unserializable value') {
+    super(message)
+    this.name = 'PayloadNotSerializableError'
+  }
+}
+
+/**
+ * Return true if `payload` will round-trip through `JSON.stringify` with no
+ * fields silently disappearing OR silently morphing into `null`. Rejects:
+ * - top-level `undefined` (JSON.stringify short-circuits without invoking the replacer)
+ * - top-level `function` / `symbol` / `bigint` (same short-circuit path)
+ * - ANY nested `undefined` / `function` / `symbol` / `bigint` (would be dropped from
+ *   the encoded envelope; `{ok: true, data: undefined}` becomes `{"ok":true}` and
+ *   the receiver's expectation quietly diverges from what the sender thinks it sent)
+ * - ANY `NaN` / `Infinity` / `-Infinity` at any depth (JSON.stringify silently
+ *   coerces these to `null` on the wire — a "42 becomes null" bug is worse than
+ *   a clean reject at the send-side boundary)
+ * - anything with a hostile `toJSON` that throws
+ */
+export function payloadIsJsonSerializable(payload: unknown): boolean {
+  if (payload === undefined) return false
+  const rootKind = typeof payload
+  if (rootKind === 'function' || rootKind === 'symbol' || rootKind === 'bigint') return false
+  if (rootKind === 'number' && !Number.isFinite(payload as number)) return false
+  try {
+    JSON.stringify(payload, (_key, value) => {
+      if (
+        value === undefined ||
+        typeof value === 'function' ||
+        typeof value === 'symbol' ||
+        typeof value === 'bigint'
+      ) {
+        throw new PayloadNotSerializableError()
+      }
+      if (typeof value === 'number' && !Number.isFinite(value)) {
+        throw new PayloadNotSerializableError()
+      }
+      return value
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Validate the v1 wire envelope before it reaches any bus handler.
+ * Extended in Stage 3 to enforce baton-value validity on the wire.
+ */
 export function validateEnvelope(
   value: unknown,
   allowedFromClaims: ReadonlySet<string>,
@@ -180,6 +264,34 @@ export function validateEnvelope(
   const from = normalizeBotName(candidate.from)
   if (from === null || !allowedFromClaims.has(from)) return { ok: false, error: 'from_claim_rejected' }
 
+  // Baton-value validation (v1.x additive; discipline ported from bus.py::validate_envelope).
+  if (Object.hasOwn(candidate, 'root_id')) {
+    if (typeof candidate.root_id !== 'string' || candidate.root_id.length === 0) {
+      return { ok: false, error: 'claude_discord_adapter_invalid_root_id' }
+    }
+  }
+  for (const field of ['origin', 'owner'] as const) {
+    if (Object.hasOwn(candidate, field)) {
+      const claim = candidate[field]
+      const canonical = normalizeBotName(claim)
+      if (canonical === null || canonical !== claim || !allowedFromClaims.has(canonical)) {
+        return { ok: false, error: `claude_discord_adapter_invalid_${field}` }
+      }
+    }
+  }
+  if (Object.hasOwn(candidate, 'hops')) {
+    const hops = candidate.hops
+    if (!Number.isInteger(hops) || (hops as number) < 0) {
+      return { ok: false, error: 'claude_discord_adapter_invalid_hops' }
+    }
+    // The ceiling fires on both derivation (outbound throw) AND inbound wire
+    // validation — otherwise a peer publishing `hops: 100` slips past validate
+    // and is only caught if the local bot tries to derive a further increment.
+    if ((hops as number) >= 16) {
+      return { ok: false, error: 'claude_discord_adapter_invalid_hops_ceiling' }
+    }
+  }
+
   let encodedBytes: number
   try {
     encodedBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8')
@@ -191,21 +303,356 @@ export function validateEnvelope(
   return { ok: true, envelope: { ...candidate, from } as unknown as Envelope }
 }
 
+/* -------------------------------------------------------------------------- */
+/* Baton derivation                                                            */
+/* -------------------------------------------------------------------------- */
+
+export class BatonDerivationError extends Error {
+  readonly reason: string
+  constructor(reason: string, message: string) {
+    super(message)
+    this.reason = reason
+    this.name = 'BatonDerivationError'
+  }
+}
+
+export class BatonHopsExhausted extends BatonDerivationError {
+  constructor(message = 'baton hop ceiling reached') {
+    super('claude_discord_adapter_baton_hops_exhausted', message)
+    this.name = 'BatonHopsExhausted'
+  }
+}
+
+export interface BatonFields {
+  root_id: string
+  origin: string
+  owner: string
+  hops: number
+}
+
+export interface DeriveBatonInput {
+  envelopeId: string
+  botName: string
+  inbound?: Envelope
+  kind: string
+  recipient?: string | null
+}
+
 /**
- * Session-owned NATS transport. Stage 1 defines its contract only; transport,
- * subscriptions, heartbeat, injection, ledgers, and rate limiting land in the
- * subsequent implementation commits described by the v0.6 spec.
+ * Derive baton fields for an outbound envelope. Port of
+ * `codex-container/bus.py::derive_baton_fields` — port the shape, not the lines.
+ * Baton discipline is settled after three review rounds; do not redesign.
+ */
+export function deriveBatonFields(input: DeriveBatonInput): BatonFields {
+  const canonicalBot = normalizeBotName(input.botName)
+  if (canonicalBot === null) {
+    throw new BatonDerivationError(
+      'claude_discord_adapter_baton_bot_name_invalid',
+      `invalid baton origin bot name: ${String(input.botName)}`,
+    )
+  }
+  const { envelopeId, inbound, kind, recipient } = input
+  let fields: BatonFields
+  if (inbound === undefined) {
+    fields = { root_id: envelopeId, origin: canonicalBot, owner: canonicalBot, hops: 0 }
+  } else {
+    const inboundRecord = inbound as unknown as Record<string, unknown>
+    const rawRootId = inboundRecord.root_id ?? inboundRecord.id
+    const rawOrigin = inboundRecord.origin ?? inboundRecord.from
+    const rawOwner = inboundRecord.owner ?? inboundRecord.from
+    const rawHops = inboundRecord.hops
+    // Number.isInteger deliberately (typeof === 'number' would accept NaN).
+    const prevHops = Number.isInteger(rawHops) ? (rawHops as number) : 0
+    fields = {
+      root_id: rawRootId as string,
+      origin: rawOrigin as string,
+      owner: rawOwner as string,
+      hops: prevHops + 1,
+    }
+  }
+  if (kind === 'baton.handoff') {
+    const canonicalRecipient = normalizeBotName(recipient)
+    if (canonicalRecipient === null) {
+      throw new BatonDerivationError(
+        'claude_discord_adapter_baton_handoff_recipient_invalid',
+        'baton handoff requires a direct canonical recipient',
+      )
+    }
+    fields.owner = canonicalRecipient
+  }
+  if (fields.hops >= 16) {
+    throw new BatonHopsExhausted()
+  }
+  return fields
+}
+
+/* -------------------------------------------------------------------------- */
+/* Frame escape / caps                                                         */
+/* -------------------------------------------------------------------------- */
+
+const XML_ESCAPE_MAP: Record<string, string> = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&apos;',
+}
+/** Zero-width and bidi-control characters — parity with bus.py `_ZERO_WIDTH_RE`. */
+const ZERO_WIDTH_RE = /[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g
+
+function xmlEscape(value: string): string {
+  return value.replace(/[&<>"']/g, char => XML_ESCAPE_MAP[char] ?? char)
+}
+
+/**
+ * Sanitize an identifier field for use as an XML attribute value.
+ * Identifier fields (env_id, req_id, root_id) are XML-escaped but NOT
+ * zero-width stripped — they must remain byte-identical for audit
+ * correlation across the fleet.
+ */
+export function escapeFrameIdentifier(value: unknown, maxLen = DEFAULT_ATTR_MAX_LEN): string {
+  const escaped = xmlEscape(String(value))
+  if (escaped.length > maxLen) throw new RangeError(`frame identifier exceeds ${maxLen} chars (${escaped.length})`)
+  return escaped
+}
+
+/**
+ * Sanitize a human-visible content field for use as an XML attribute value.
+ * Zero-width characters are stripped BEFORE escaping to prevent hidden
+ * injection surface from RTL overrides or invisible spacers.
+ */
+export function escapeFrameContent(value: unknown, maxLen = DEFAULT_ATTR_MAX_LEN): string {
+  const stripped = String(value).replace(ZERO_WIDTH_RE, '')
+  const escaped = xmlEscape(stripped)
+  if (escaped.length > maxLen) throw new RangeError(`frame content exceeds ${maxLen} chars (${escaped.length})`)
+  return escaped
+}
+
+/**
+ * Trim a trailing partial XML entity (e.g. `...&am` cut mid-entity) back to
+ * the last completed character so the resulting slice is well-formed XML.
+ */
+function trimTrailingPartialEntity(value: string): string {
+  const lastAmp = value.lastIndexOf('&')
+  if (lastAmp === -1) return value
+  const tail = value.slice(lastAmp)
+  if (tail.includes(';')) return value
+  return value.slice(0, lastAmp)
+}
+
+/**
+ * JSON-encode a payload for the frame body with an 8KB cap + truncation
+ * marker. The cap is measured on the ESCAPED output — a payload full of
+ * `& < > " '` expands 1 byte to 5 (`&` → `&amp;`), so measuring raw bytes
+ * could yield a ~5× overrun of the guaranteed injection surface.
+ */
+export function buildFleetBusFramePayloadBody(
+  envelope: Envelope,
+  maxBytes = DEFAULT_PAYLOAD_BODY_MAX_BYTES,
+): { body: string; truncated: boolean } {
+  const encoded = JSON.stringify(envelope.payload) ?? 'null'
+  const escaped = xmlEscape(encoded)
+  const escapedSize = Buffer.byteLength(escaped, 'utf8')
+  if (escapedSize <= maxBytes) return { body: escaped, truncated: false }
+  // env_id is XML-escaped so a hostile id can't break out of the <payload> tag.
+  const marker = `\n[...truncated 8KB max, full envelope in audit log env_id=${xmlEscape(String(envelope.id))}]`
+  const truncatedBytes = Buffer.from(escaped, 'utf8').subarray(0, maxBytes).toString('utf8')
+  // Guard against splitting a multi-byte entity (`&amp;` etc.) at the cap.
+  const safeBody = trimTrailingPartialEntity(truncatedBytes)
+  return { body: safeBody + marker, truncated: true }
+}
+
+export function buildFleetBusFrameMeta(event: FleetBusSessionEvent): FleetBusFrameMeta {
+  const { envelope, reqId, lateReplyEnvId } = event
+  const meta: FleetBusFrameMeta = {
+    source: 'fleet-bus',
+    authenticated: 'false',
+    from_claim: escapeFrameContent(envelope.from),
+    kind: escapeFrameContent(envelope.kind),
+    req_id: escapeFrameIdentifier(reqId),
+    env_id: escapeFrameIdentifier(envelope.id),
+    ts: escapeFrameIdentifier(envelope.ts),
+  }
+  if (lateReplyEnvId !== undefined) {
+    meta.late_reply_env_id = escapeFrameIdentifier(lateReplyEnvId)
+  }
+  return meta
+}
+
+/** Build a complete `<channel>` injection frame for the given session event. */
+export function buildFleetBusFrame(event: FleetBusSessionEvent): string {
+  const meta = buildFleetBusFrameMeta(event)
+  const { envelope } = event
+  const attrParts = [
+    `source="${meta.source}"`,
+    `authenticated="${meta.authenticated}"`,
+    `from_claim="${meta.from_claim}"`,
+    `kind="${meta.kind}"`,
+    `env_id="${meta.env_id}"`,
+    `req_id="${meta.req_id}"`,
+    `ts="${meta.ts}"`,
+  ]
+  if (meta.late_reply_env_id !== undefined) {
+    attrParts.push(`late_reply_env_id="${meta.late_reply_env_id}"`)
+  }
+  for (const field of ['root_id', 'origin', 'owner', 'hops'] as const) {
+    const value = envelope[field]
+    if (value === undefined || value === null) continue
+    attrParts.push(`${field}="${escapeFrameIdentifier(value)}"`)
+  }
+  const { body } = buildFleetBusFramePayloadBody(envelope)
+  return `<channel ${attrParts.join(' ')}>\n<payload>${body}</payload>\n</channel>`
+}
+
+/* -------------------------------------------------------------------------- */
+/* Default rate limiter (fixed-window per key)                                 */
+/* -------------------------------------------------------------------------- */
+
+/** Simple per-key fixed-window rate limiter. Sufficient for the 30/min-class limits. */
+export class FixedWindowBucket implements TokenBucket {
+  private readonly windows = new Map<string, { count: number; expiresAt: number }>()
+  constructor(
+    public readonly capacity: number,
+    public readonly windowMs: number,
+    private readonly clock: () => number = () => Date.now(),
+  ) {}
+
+  allow(key: string): boolean {
+    const now = this.clock()
+    const window = this.windows.get(key)
+    if (window === undefined || window.expiresAt <= now) {
+      this.windows.set(key, { count: 1, expiresAt: now + this.windowMs })
+      return true
+    }
+    if (window.count >= this.capacity) return false
+    window.count += 1
+    return true
+  }
+}
+
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+export function defaultRateLimiters(): FleetBusRateLimiters {
+  const window = envInt('FLEET_BUS_RATE_WINDOW_MS', 60_000)
+  return {
+    perFrom: new FixedWindowBucket(envInt('FLEET_BUS_RATE_PER_FROM', 30), window),
+    perSubject: new FixedWindowBucket(envInt('FLEET_BUS_RATE_PER_SUBJECT', 120), window),
+    perSessionInject: new FixedWindowBucket(envInt('FLEET_BUS_RATE_PER_SESSION_INJECT', 30), window),
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Bounded LRU (Map insertion order + delete-on-touch)                         */
+/* -------------------------------------------------------------------------- */
+
+class BoundedLru<K, V> {
+  private readonly store = new Map<K, V>()
+  constructor(
+    public readonly capacity: number,
+    private readonly onEvict?: (key: K, value: V) => void,
+  ) {}
+
+  get size(): number {
+    return this.store.size
+  }
+
+  has(key: K): boolean {
+    return this.store.has(key)
+  }
+
+  get(key: K): V | undefined {
+    const value = this.store.get(key)
+    if (value === undefined) return undefined
+    // Touch — re-insert to move to the end.
+    this.store.delete(key)
+    this.store.set(key, value)
+    return value
+  }
+
+  set(key: K, value: V): void {
+    if (this.store.has(key)) this.store.delete(key)
+    this.store.set(key, value)
+    while (this.store.size > this.capacity) {
+      const oldest = this.store.keys().next().value
+      if (oldest === undefined) break
+      const evicted = this.store.get(oldest)!
+      this.store.delete(oldest)
+      this.onEvict?.(oldest, evicted)
+    }
+  }
+
+  delete(key: K): boolean {
+    return this.store.delete(key)
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Inflight ledger types                                                       */
+/* -------------------------------------------------------------------------- */
+
+interface InflightEntry {
+  envelope: Envelope
+  expectedFrom: string
+  /** Local publish-side req_id — preserved so the matched-reply audit can
+   * correlate the reply back to the original request in the log. */
+  reqId: string
+  resolve: (result: FleetBusRequestResult) => void
+  timerId: ReturnType<typeof setTimeout>
+}
+
+/* -------------------------------------------------------------------------- */
+/* FleetBus                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Session-owned NATS transport. Stage 3 adds request/reply, supervisor loop,
+ * suppression-aware reply inject, and per-key rate limiting.
  */
 export class FleetBus {
   private nc?: NatsConnection
   private readonly subscriptions = new Set<Subscription>()
   private heartbeatTimer?: ReturnType<typeof setInterval>
   private readonly codec = JSONCodec<unknown>()
+  private readonly mode: FleetBusMode
+  private readonly outboundLedger: BoundedLru<string, InflightEntry>
+  private readonly receiveLedger: BoundedLru<string, Envelope>
+  private readonly evictedLedger: BoundedLru<string, true>
+  // Envelope-id dedup ledgers (round-8 P2): peers can retry the same wire
+  // envelope; without this both the .result and .request handlers happily
+  // re-inject each retry as a fresh session turn. Storing the reqId used at
+  // first-handle lets the drop audit correlate back to the original turn.
+  private readonly seenResultEnvelopes: BoundedLru<string, { reqId: string; ts: number }>
+  private readonly seenRequestEnvelopes: BoundedLru<string, { reqId: string; ts: number }>
+  private readonly rateLimiters: FleetBusRateLimiters
+  private readonly connectFn: (options: ConnectionOptions) => Promise<NatsConnection>
+  private supervisorStopping = false
+  private closedResolver?: () => void
 
   constructor(
     private readonly config: FleetBusConfig,
     private readonly allowedFromClaims: ReadonlySet<string>,
-  ) {}
+  ) {
+    this.mode = config.mode ?? 'primary'
+    this.connectFn = config.connectFn ?? natsConnect
+    this.rateLimiters = config.rateLimiters ?? defaultRateLimiters()
+    this.outboundLedger = new BoundedLru<string, InflightEntry>(
+      config.inflightLedgerCap ?? DEFAULT_INFLIGHT_LEDGER_CAP,
+      (_key, entry) => this.onInflightEvict(entry),
+    )
+    this.receiveLedger = new BoundedLru<string, Envelope>(config.receiveLedgerCap ?? DEFAULT_RECEIVE_LEDGER_CAP)
+    this.evictedLedger = new BoundedLru<string, true>(config.evictedLedgerCap ?? DEFAULT_EVICTED_LEDGER_CAP)
+    this.seenResultEnvelopes = new BoundedLru<string, { reqId: string; ts: number }>(
+      config.seenResultLedgerCap ?? DEFAULT_SEEN_RESULT_LEDGER_CAP,
+    )
+    this.seenRequestEnvelopes = new BoundedLru<string, { reqId: string; ts: number }>(
+      config.seenRequestLedgerCap ?? DEFAULT_SEEN_REQUEST_LEDGER_CAP,
+    )
+  }
 
   async connect(): Promise<void> {
     if (this.nc) return
@@ -216,27 +663,30 @@ export class FleetBus {
       throw new Error('FleetBus botName and user must be the same canonical fleet identity')
     }
 
-    const nc = await natsConnect({
+    const nc = await this.connectFn({
       servers: this.config.url,
       user,
       pass: this.config.password,
       inboxPrefix: `_INBOX_${botName}`,
+      maxReconnectAttempts: -1,
     })
 
     try {
       this.nc = nc
-      this.subscribe(`fleet.${botName}.request`, message => this.onRequest(message))
-      this.subscribe(`fleet.${botName}.result`, message => this.onResult(message))
-      this.subscribe(`fleet.${botName}.status`, message => this.onStatus(message))
-      if (this.config.subscribeBroadcast) {
-        this.subscribe('fleet.broadcast.>', message => this.onBroadcast(message))
+      if (this.mode !== 'publish-only') {
+        this.subscribe(`fleet.${botName}.request`, message => this.onRequest(message))
+        this.subscribe(`fleet.${botName}.result`, message => this.onResult(message))
+        this.subscribe(`fleet.${botName}.status`, message => this.onStatus(message))
+        if (this.config.subscribeBroadcast) {
+          this.subscribe('fleet.broadcast.>', message => this.onBroadcast(message))
+        }
+        this.publishHeartbeat()
+        this.heartbeatTimer = setInterval(
+          () => this.publishHeartbeat(),
+          this.config.heartbeatIntervalMs ?? 30_000,
+        )
       }
-      this.publishHeartbeat()
-      this.heartbeatTimer = setInterval(
-        () => this.publishHeartbeat(),
-        this.config.heartbeatIntervalMs ?? 30_000,
-      )
-      this.log(`connected as ${botName}`)
+      this.log(`connected as ${botName}${this.mode === 'publish-only' ? ' [publish-only]' : ''}`)
       void this.watchConnectionStatus(nc)
     } catch (error) {
       this.nc = undefined
@@ -254,24 +704,222 @@ export class FleetBus {
     const nc = this.nc
     this.nc = undefined
     if (nc && !nc.isClosed()) await nc.drain()
+    const resolver = this.closedResolver
+    this.closedResolver = undefined
+    resolver?.()
   }
 
-  async request(_options: FleetBusRequestOptions): Promise<FleetBusRequestResult> {
-    // TODO(stage-3): publish request and optionally await the ephemeral inbox.
-    throw new Error('FleetBus.request is not implemented')
+  /**
+   * Run the supervisor loop: connect, wait for CLOSED, disconnect (clears
+   * subscriptions/heartbeat/nc reference), sleep, retry. Closes only when
+   * `stop()` is called.
+   */
+  async run(): Promise<void> {
+    const sleepMs = this.config.supervisorSleepMs ?? 2_000
+    this.supervisorStopping = false
+    while (!this.supervisorStopping) {
+      try {
+        await this.connect()
+      } catch (error) {
+        this.log(`supervisor: connect failed: ${String(error)}`)
+        await this.disconnect().catch(() => {})
+        if (this.supervisorStopping) break
+        await this.sleep(sleepMs)
+        continue
+      }
+      // Race: stop() may have fired while connect() was in flight. Recheck
+      // BEFORE waitClosed / subscribe traffic so the caller isn't left with
+      // a live connection they thought was torn down.
+      if (this.supervisorStopping) {
+        await this.disconnect().catch(() => {})
+        break
+      }
+      await this.waitClosed()
+      if (this.supervisorStopping) break
+      this.log('supervisor: connection closed, reconnecting after backoff')
+      await this.disconnect().catch(() => {})
+      await this.sleep(sleepMs)
+    }
+    await this.disconnect().catch(() => {})
   }
 
-  publishReply(_reqId: string, _payload: unknown, _kind = 'result'): FleetBusReplyResult {
-    // TODO(stage-3): resolve the server-side inflight ledger and publish reply.
-    throw new Error('FleetBus.publishReply is not implemented')
+  async stop(): Promise<void> {
+    this.supervisorStopping = true
+    const resolver = this.closedResolver
+    this.closedResolver = undefined
+    resolver?.()
+    await this.disconnect()
+  }
+
+  private waitClosed(): Promise<void> {
+    if (!this.nc) return Promise.resolve()
+    const closedByServer = this.nc.closed().then(() => undefined).catch(() => undefined)
+    const explicit = new Promise<void>(resolve => {
+      this.closedResolver = resolve
+    })
+    return Promise.race([closedByServer, explicit])
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+
+  async request(options: FleetBusRequestOptions): Promise<FleetBusRequestResult> {
+    if (this.mode === 'publish-only' && options.wait === true) {
+      return { ok: false, error: 'claude_discord_adapter_multi_instance_publish_only' }
+    }
+    if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected' }
+
+    const canonicalTo = normalizeBotName(options.to)
+    if (canonicalTo === null) return { ok: false, error: 'claude_discord_adapter_invalid_recipient' }
+    if (!payloadIsJsonSerializable(options.payload)) {
+      this.recordAudit({
+        dir: 'drop', subject: `fleet.${canonicalTo}.request`,
+        reason: 'claude_discord_adapter_payload_not_json_serializable',
+      })
+      return { ok: false, error: 'claude_discord_adapter_payload_not_json_serializable' }
+    }
+    const canonicalBot = normalizeBotName(this.config.botName)!
+    const envelopeId = randomUUID()
+    let baton: BatonFields
+    try {
+      baton = deriveBatonFields({
+        envelopeId,
+        botName: canonicalBot,
+        inbound: options.inbound,
+        kind: options.kind,
+        recipient: options.to,
+      })
+    } catch (error) {
+      const reason = error instanceof BatonDerivationError ? error.reason : 'claude_discord_adapter_baton_derivation_failed'
+      this.recordAudit({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason, envelope_id: envelopeId })
+      return { ok: false, error: reason }
+    }
+    const envelope: Envelope = {
+      envelope_version: 1,
+      id: envelopeId,
+      from: canonicalBot,
+      to: canonicalTo,
+      kind: options.kind,
+      ts: new Date().toISOString(),
+      payload: options.payload,
+      ...baton,
+    }
+    const validation = validateEnvelope(envelope, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
+    if (!validation.ok) {
+      this.recordAudit({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason: validation.error, envelope_id: envelopeId })
+      return { ok: false, error: validation.error, envelope }
+    }
+    const subject = `fleet.${canonicalTo}.request`
+    // Local publish-side req_id per SPEC §8 — outbound audits must carry both
+    // envelope_id and req_id for cross-line correlation (mirrors bus.py:341).
+    const localReqId = randomBytes(16).toString('hex')
+    try {
+      this.nc.publish(subject, this.codec.encode(envelope))
+    } catch (error) {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, req_id: localReqId, error: String(error) })
+      return { ok: false, error: 'claude_discord_adapter_publish_failed', envelope }
+    }
+    this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId, req_id: localReqId })
+
+    if (options.wait !== true) {
+      // Core NATS publish does not confirm subscriber receipt; omit
+      // `delivered_to_subscriber` entirely so the caller can't misread
+      // "we published" as "someone consumed it". True is reserved for the
+      // wait: true path where a matching .result reply arrives.
+      return { ok: true, envelope }
+    }
+
+    const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+    return new Promise<FleetBusRequestResult>(resolve => {
+      const timerId = setTimeout(() => {
+        // Timeout fires — evict from ledger, remember for late-reply tagging, resolve as timed_out.
+        if (this.outboundLedger.has(envelopeId)) {
+          this.outboundLedger.delete(envelopeId)
+          this.evictedLedger.set(envelopeId, true)
+          this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_request_timeout', envelope_id: envelopeId, req_id: localReqId })
+          resolve({ ok: false, timed_out: true, envelope })
+        }
+      }, timeoutMs)
+      this.outboundLedger.set(envelopeId, {
+        envelope,
+        expectedFrom: canonicalTo,
+        reqId: localReqId,
+        resolve,
+        timerId,
+      })
+    })
+  }
+
+  publishReply(reqId: string, payload: unknown, kind = 'result'): FleetBusReplyResult {
+    if (this.mode === 'publish-only') {
+      return { ok: false, error: 'claude_discord_adapter_multi_instance_publish_only', req_id: reqId }
+    }
+    if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected', req_id: reqId }
+    const inbound = this.receiveLedger.get(reqId)
+    if (inbound === undefined) return { ok: false, error: 'claude_discord_adapter_req_id_unknown', req_id: reqId }
+    if (!payloadIsJsonSerializable(payload)) {
+      this.recordAudit({
+        dir: 'drop', subject: `fleet.${inbound.from}.result`,
+        reason: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId,
+      })
+      return { ok: false, error: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId }
+    }
+    const canonicalBot = normalizeBotName(this.config.botName)!
+    const envelopeId = randomUUID()
+    let baton: BatonFields
+    try {
+      baton = deriveBatonFields({
+        envelopeId,
+        botName: canonicalBot,
+        inbound,
+        kind,
+        recipient: inbound.from,
+      })
+    } catch (error) {
+      const reason = error instanceof BatonDerivationError ? error.reason : 'claude_discord_adapter_baton_derivation_failed'
+      this.recordAudit({ dir: 'drop', subject: `fleet.${inbound.from}.result`, reason, envelope_id: envelopeId })
+      return { ok: false, error: reason, req_id: reqId }
+    }
+    const envelope: Envelope = {
+      envelope_version: 1,
+      id: envelopeId,
+      from: canonicalBot,
+      to: inbound.from,
+      kind,
+      // Wire correlation uses the inbound WIRE id, not the consumer-local reqId nonce (round-2 P1).
+      in_reply_to: inbound.id,
+      ts: new Date().toISOString(),
+      payload,
+      ...baton,
+    }
+    const validation = validateEnvelope(envelope, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
+    if (!validation.ok) {
+      this.recordAudit({ dir: 'drop', subject: `fleet.${inbound.from}.result`, reason: validation.error, envelope_id: envelopeId })
+      return { ok: false, error: validation.error, req_id: reqId, envelope }
+    }
+    const subject = `fleet.${inbound.from}.result`
+    try {
+      this.nc.publish(subject, this.codec.encode(envelope))
+    } catch (error) {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, error: String(error) })
+      return { ok: false, error: 'claude_discord_adapter_publish_failed', req_id: reqId, envelope }
+    }
+    this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId, req_id: reqId })
+    return { ok: true, envelope, req_id: reqId }
   }
 
   protected async onRequest(message: Msg): Promise<void> {
+    const subject = message.subject
+    if (!this.rateLimiters.perSubject.allow(subject)) {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_rate_limited_per_subject' })
+      return
+    }
     let decoded: unknown
     try {
       decoded = this.codec.decode(message.data)
     } catch {
-      this.recordAudit({ dir: 'drop', subject: message.subject, reason: 'malformed_json' })
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' })
       return
     }
     const result = validateEnvelope(
@@ -280,28 +928,213 @@ export class FleetBus {
       this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
     )
     if (!result.ok) {
-      this.recordAudit({ dir: 'drop', subject: message.subject, reason: result.error })
+      this.recordAudit({ dir: 'drop', subject, reason: result.error })
       return
     }
     if (normalizeBotName(result.envelope.to) !== normalizeBotName(this.config.botName)) {
       this.recordAudit({
         dir: 'drop',
-        subject: message.subject,
+        subject,
         reason: 'recipient_mismatch',
+        envelope_id: result.envelope.id,
+      })
+      return
+    }
+    if (!this.rateLimiters.perFrom.allow(result.envelope.from)) {
+      this.recordAudit({
+        dir: 'drop',
+        subject,
+        reason: 'claude_discord_adapter_rate_limited_per_from',
+        envelope_id: result.envelope.id,
+      })
+      return
+    }
+    // Envelope-id dedup (round-8 P2, class-widened from onResult). Peers can
+    // retry `.request` frames for the same reasons they retry `.result` —
+    // transport re-send, publisher restart, back-off retries. Without this
+    // gate the retry mints a fresh reqId and injects as a second session
+    // turn. Separate ledger from seenResultEnvelopes so a peer with the same
+    // wire id on both subjects (protocol violation, but possible) can't
+    // silently swallow one side.
+    const seenRequest = this.seenRequestEnvelopes.get(result.envelope.id)
+    if (seenRequest !== undefined) {
+      this.recordAudit({
+        dir: 'drop',
+        subject,
+        reason: 'claude_discord_adapter_duplicate_request_envelope',
+        envelope_id: result.envelope.id,
+        req_id: seenRequest.reqId,
+      })
+      return
+    }
+    if (!this.rateLimiters.perSessionInject.allow('session')) {
+      this.recordAudit({
+        dir: 'drop',
+        subject,
+        reason: 'claude_discord_adapter_rate_limited_per_session_inject',
         envelope_id: result.envelope.id,
       })
       return
     }
 
     const reqId = randomBytes(16).toString('hex')
-    await this.injectIntoSession(result.envelope, reqId).catch(error => {
-      this.recordAudit({ dir: 'drop', subject: message.subject, reason: 'injection_failed', error: String(error) })
+    this.seenRequestEnvelopes.set(result.envelope.id, { reqId, ts: Date.now() })
+    this.receiveLedger.set(reqId, result.envelope)
+    // Single dir:in audit per received envelope (dedup fix, round-3 P2).
+    this.recordAudit({ dir: 'in', subject, envelope_id: result.envelope.id, req_id: reqId })
+    await this.injectIntoSession({ envelope: result.envelope, reqId }).catch(error => {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
     })
   }
 
-  protected onResult(message: Msg): void {
-    this.log(`received ${message.subject}`)
-    // TODO(stage-3): validate, gate, dedupe, and resolve waiter or inject result.
+  protected async onResult(message: Msg): Promise<void> {
+    const subject = message.subject
+    if (!this.rateLimiters.perSubject.allow(subject)) {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_rate_limited_per_subject' })
+      return
+    }
+    let decoded: unknown
+    try {
+      decoded = this.codec.decode(message.data)
+    } catch {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' })
+      return
+    }
+    const validation = validateEnvelope(
+      decoded,
+      this.allowedFromClaims,
+      this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
+    )
+    if (!validation.ok) {
+      this.recordAudit({ dir: 'drop', subject, reason: validation.error })
+      return
+    }
+    const envelope = validation.envelope
+    const canonicalBot = normalizeBotName(this.config.botName)
+    // Preserve the raw-null distinction (Ohm round-7 P1). A legitimate
+    // broadcast reply has `to == null` (loose equality: null or undefined) and
+    // is allowed through. Any *present* non-null recipient MUST canonicalize to
+    // this bot; otherwise it is either misrouted or an invalid recipient
+    // string, both of which drop as misrouted_reply. Do NOT collapse null and
+    // an invalid `normalizeBotName()` return into the same "recipient absent"
+    // branch — that lets `.result` frames with `to: "not.a.bot"` slip past the
+    // gate and resolve waiters in the outbound ledger.
+    if (envelope.to != null) {
+      const canonicalTo = normalizeBotName(envelope.to)
+      if (canonicalTo !== canonicalBot) {
+        this.recordAudit({
+          dir: 'drop',
+          subject,
+          reason: 'claude_discord_adapter_misrouted_reply',
+          envelope_id: envelope.id,
+        })
+        return
+      }
+    }
+    if (!this.rateLimiters.perFrom.allow(envelope.from)) {
+      this.recordAudit({
+        dir: 'drop',
+        subject,
+        reason: 'claude_discord_adapter_rate_limited_per_from',
+        envelope_id: envelope.id,
+      })
+      return
+    }
+
+    // Envelope-id dedup (round-8 P2): peers can retry a `.result` for many
+    // reasons (transport re-send, publisher restart). Without this gate, the
+    // first copy resolves the waiter + drops out of the inflight ledger, then
+    // the second copy hits the no-match branch and injects as a fresh
+    // unsolicited turn with a NEW reqId. The evictedLedger doesn't help — it
+    // was already consumed by the first arrival. Bounded envelope-id ledger
+    // catches both the ledger-matched retry AND the unsolicited retry AND the
+    // late-reply retry (which would otherwise re-inject without the late-reply
+    // tag on the second arrival). Runs AFTER validate/recipient/rate-limit
+    // gates so a flood of duplicates from a bad peer still hits per-from/
+    // per-subject limits first.
+    const seenResult = this.seenResultEnvelopes.get(envelope.id)
+    if (seenResult !== undefined) {
+      this.recordAudit({
+        dir: 'drop',
+        subject,
+        reason: 'claude_discord_adapter_duplicate_result_envelope',
+        envelope_id: envelope.id,
+        req_id: seenResult.reqId,
+      })
+      return
+    }
+
+    const inReplyTo = envelope.in_reply_to
+    if (inReplyTo !== undefined) {
+      const match = this.outboundLedger.get(inReplyTo)
+      if (match !== undefined) {
+        if (envelope.from === match.expectedFrom) {
+          // Ledger-matched .result: resolve the outstanding waiter and BYPASS
+          // perSessionInject — this resolves an already-running tool call
+          // rather than initiating a new session turn (P2-5). Preserve the
+          // ORIGINAL request's req_id on the audit line so log correlation
+          // (reply-to-request) survives.
+          clearTimeout(match.timerId)
+          this.outboundLedger.delete(inReplyTo)
+          // Record BEFORE resolve so a synchronous consumer that re-enters
+          // handleResult on the same envelope sees the dedup gate armed.
+          this.seenResultEnvelopes.set(envelope.id, { reqId: match.reqId, ts: Date.now() })
+          this.recordAudit({
+            dir: 'in', subject, envelope_id: envelope.id,
+            req_id: match.reqId, note: 'claude_discord_adapter_ledger_matched',
+          })
+          match.resolve({ ok: true, envelope: match.envelope, delivered_to_subscriber: true, reply: envelope })
+          return
+        }
+        // From mismatch — anti-hijack (P2-1). Do NOT resolve the waiter; treat
+        // as unsolicited and let the model see it if inject budget allows.
+        this.recordAudit({
+          dir: 'drop',
+          subject,
+          reason: 'claude_discord_adapter_reply_from_mismatch',
+          envelope_id: envelope.id,
+          req_id: match.reqId,
+          expected_from: match.expectedFrom,
+        })
+        await this.injectUnsolicited(subject, envelope)
+        return
+      }
+    }
+
+    // No ledger match — inject as unsolicited. Tag as late-reply if we
+    // remember evicting a request with this id (P2-2).
+    const lateReplyEnvId = inReplyTo !== undefined && this.evictedLedger.has(inReplyTo) ? inReplyTo : undefined
+    if (lateReplyEnvId !== undefined) this.evictedLedger.delete(lateReplyEnvId)
+    await this.injectUnsolicited(subject, envelope, lateReplyEnvId)
+  }
+
+  private async injectUnsolicited(subject: string, envelope: Envelope, lateReplyEnvId?: string): Promise<void> {
+    if (!this.rateLimiters.perSessionInject.allow('session')) {
+      this.recordAudit({
+        dir: 'drop',
+        subject,
+        reason: 'claude_discord_adapter_rate_limited_per_session_inject',
+        envelope_id: envelope.id,
+      })
+      return
+    }
+    const reqId = randomBytes(16).toString('hex')
+    // Round-8 P2: any inject path that reaches this line has committed a
+    // session turn to this envelope; a duplicate arriving later must be
+    // deduped so we don't burn another turn on the same wire id.
+    this.seenResultEnvelopes.set(envelope.id, { reqId, ts: Date.now() })
+    this.receiveLedger.set(reqId, envelope)
+    this.recordAudit({
+      dir: 'in',
+      subject,
+      envelope_id: envelope.id,
+      req_id: reqId,
+      note: lateReplyEnvId !== undefined ? 'claude_discord_adapter_late_reply' : 'claude_discord_adapter_unsolicited_reply',
+      ...(lateReplyEnvId !== undefined ? { late_reply_env_id: lateReplyEnvId } : {}),
+    })
+    await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId }).catch(error => {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
+    })
   }
 
   protected onStatus(message: Msg): void {
@@ -310,6 +1143,21 @@ export class FleetBus {
 
   protected onBroadcast(message: Msg): void {
     this.log(`received ${message.subject}`)
+  }
+
+  private onInflightEvict(entry: InflightEntry): void {
+    // LRU eviction of a pending waiter — reject with ledger_overflow AND clear
+    // the timer (not a silent limp-to-timeout, per round-3 P2-3).
+    clearTimeout(entry.timerId)
+    this.evictedLedger.set(entry.envelope.id, true)
+    this.recordAudit({
+      dir: 'drop',
+      subject: `fleet.${entry.envelope.to}.request`,
+      reason: 'claude_discord_adapter_ledger_overflow',
+      envelope_id: entry.envelope.id,
+      req_id: entry.reqId,
+    })
+    entry.resolve({ ok: false, error: 'claude_discord_adapter_ledger_overflow', envelope: entry.envelope })
   }
 
   private subscribe(subject: string, handler: (message: Msg) => void | Promise<void>): void {
@@ -346,13 +1194,38 @@ export class FleetBus {
     }
   }
 
-  private async injectIntoSession(envelope: Envelope, reqId: string): Promise<void> {
+  /**
+   * Dispatch the envelope to the session callback. Deliberately does NOT
+   * write the primary `dir: in` audit here — every caller writes exactly
+   * one `dir: in` BEFORE calling this method, so unsolicited/late replies
+   * can carry their `note` field without producing a duplicate audit entry
+   * (P2 round 3).
+   *
+   * DOES persist the full payload as a `dir: out` audit line WHEN the
+   * standard 8KB body cap would truncate — from FleetBus's perspective the
+   * frame is outbound to the session. The injection frame's marker
+   * (`[...full envelope in audit log env_id=<id>]`) is only a truthful
+   * promise if the full envelope is actually somewhere in the audit log
+   * (P2 round 4). Uses `dir: 'out'` per SPEC §8's audit-dir schema
+   * (`in|out|drop`); the distinctive `reason` field distinguishes this
+   * from NATS-outbound publishes (P2 round 6).
+   */
+  private async injectIntoSession(event: FleetBusSessionEvent): Promise<void> {
+    const { truncated } = buildFleetBusFramePayloadBody(event.envelope)
+    if (truncated) {
+      this.recordAudit({
+        dir: 'out',
+        reason: 'claude_discord_adapter_payload_body_truncated',
+        envelope_id: event.envelope.id,
+        req_id: event.reqId,
+        payload_full: JSON.stringify(event.envelope.payload) ?? 'null',
+      })
+    }
     if (!this.config.injectIntoSession) {
-      this.log(`received ${envelope.kind} from ${envelope.from}; session injection is not configured`)
+      this.log(`received ${event.envelope.kind} from ${event.envelope.from}; session injection is not configured`)
       return
     }
-    await this.config.injectIntoSession({ envelope, reqId })
-    this.recordAudit({ dir: 'in', envelope, req_id: reqId })
+    await this.config.injectIntoSession(event)
   }
 
   private recordAudit(entry: Record<string, unknown>): void {
@@ -375,4 +1248,18 @@ export class FleetBus {
   private log(message: string): void {
     this.config.logger?.(`FleetBus: ${message}`)
   }
+}
+
+/**
+ * Convenience: build a bus and start its supervisor loop.
+ * Returns `{ bus, done }` — await `done` to block until `bus.stop()` is called,
+ * or ignore it and call `bus.stop()` at shutdown.
+ */
+export function runSupervisor(
+  config: FleetBusConfig,
+  allowedFromClaims: ReadonlySet<string>,
+): { bus: FleetBus; done: Promise<void> } {
+  const bus = new FleetBus(config, allowedFromClaims)
+  const done = bus.run()
+  return { bus, done }
 }
