@@ -1010,7 +1010,7 @@ export class FleetBus {
           this.outboundLedger.delete(inReplyTo)
           this.recordAudit({
             dir: 'in', subject, envelope_id: envelope.id,
-            req_id: match.reqId, note: 'ledger_matched',
+            req_id: match.reqId, note: 'claude_discord_adapter_ledger_matched',
           })
           match.resolve({ ok: true, envelope: match.envelope, delivered_to_subscriber: true, reply: envelope })
           return

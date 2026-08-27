@@ -832,7 +832,7 @@ describe('request / publishReply / onResult', () => {
       e => e.dir === 'in' && e.envelope_id === 'reply-uuid-3',
     )
     expect(matchedEntry).toBeDefined()
-    expect(matchedEntry!.note).toBe('ledger_matched')
+    expect(matchedEntry!.note).toBe('claude_discord_adapter_ledger_matched')
     // THIS is the round-3 P2: the matched-reply's inbound audit must carry
     // the original request's req_id so operators can correlate reply-to-request.
     expect(matchedEntry!.req_id).toBe(requestReqId)
