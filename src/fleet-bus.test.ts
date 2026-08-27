@@ -20,6 +20,7 @@ import {
   loadFleetManifestAllowlist,
   normalizeAllowlist,
   normalizeBotName,
+  payloadIsJsonSerializable,
   runSupervisor,
   validateEnvelope,
   type Envelope,
@@ -582,7 +583,9 @@ describe('request / publishReply / onResult', () => {
 
     const result = await bus.request({ to: 'kat', kind: 'text_message', payload: { hi: true } })
     expect(result.ok).toBe(true)
-    expect(result.delivered_to_subscriber).toBe(true)
+    // Core NATS publish gives no proof of subscriber receipt — this field
+    // is reserved for the wait:true + ledger-matched-reply path (P1 round 2).
+    expect(result.delivered_to_subscriber).toBeUndefined()
     expect(result.reply).toBeUndefined()
     expect(nc.publishes).toHaveLength(1)
     expect(nc.publishes[0]!.subject).toBe('fleet.kat.request')
@@ -703,9 +706,16 @@ describe('request / publishReply / onResult', () => {
   })
 
   test.each([
-    ['undefined', undefined],
-    ['function', () => { /* noop */ }],
-    ['symbol', Symbol('x')],
+    ['top-level undefined', undefined],
+    ['top-level function', () => { /* noop */ }],
+    ['top-level symbol', Symbol('x')],
+    ['top-level bigint', BigInt(1)],
+    ['nested undefined', { ok: true, data: undefined }],
+    ['deeply nested undefined', { a: { b: { c: undefined } } }],
+    ['nested function', { ok: true, cb: () => 1 }],
+    ['nested symbol', { ok: true, s: Symbol('nested') }],
+    ['nested bigint', { ok: true, n: BigInt(42) }],
+    ['undefined inside array', [1, undefined, 3]],
   ])('request() rejects payload that disappears in JSON encoding — %s', async (_label, payload) => {
     const nc = new FakeNatsConnection()
     const bus = new TestFleetBus({
@@ -719,6 +729,16 @@ describe('request / publishReply / onResult', () => {
     expect(nc.publishes).toHaveLength(0)
   })
 
+  test('payloadIsJsonSerializable accepts well-formed payloads', () => {
+    expect(payloadIsJsonSerializable({})).toBe(true)
+    expect(payloadIsJsonSerializable({ a: 1, b: 'x', c: null, d: [1, 2] })).toBe(true)
+    expect(payloadIsJsonSerializable([])).toBe(true)
+    expect(payloadIsJsonSerializable('string')).toBe(true)
+    expect(payloadIsJsonSerializable(0)).toBe(true)
+    expect(payloadIsJsonSerializable(null)).toBe(true)
+    expect(payloadIsJsonSerializable(false)).toBe(true)
+  })
+
   test('publishReply() rejects unencodable payload', async () => {
     const nc = new FakeNatsConnection()
     const events: FleetBusSessionEvent[] = []
@@ -729,10 +749,51 @@ describe('request / publishReply / onResult', () => {
     bus.attachFakeNc(nc)
     await bus.handleRequest(envelope({ from: 'ohm', id: 'wire-99' }))
     const reqId = events[0]!.reqId
-    const result = bus.publishReply(reqId, undefined)
+    // Also verify nested case here — round-2 P2 was specifically about the
+    // nested-undefined silent-drop the top-level guard missed.
+    const result = bus.publishReply(reqId, { ok: true, data: undefined })
     expect(result.ok).toBe(false)
     expect(result.error).toBe('claude_discord_adapter_payload_not_json_serializable')
     expect(nc.publishes).toHaveLength(0)
+  })
+
+  test('outbound request audit carries req_id alongside envelope_id (SPEC §8)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const result = await bus.request({ to: 'kat', kind: 'text_message', payload: { hi: true } })
+    expect(result.ok).toBe(true)
+    const entries = readAudit(auditLogPath)
+    const outEntry = entries.find(e => e.dir === 'out')
+    expect(outEntry).toBeDefined()
+    expect(outEntry!.envelope_id).toBe(result.envelope!.id)
+    expect(typeof outEntry!.req_id).toBe('string')
+    expect((outEntry!.req_id as string)).toMatch(/^[a-f0-9]{32}$/)
+  })
+
+  test('wait:true + ledger-matched reply still sets delivered_to_subscriber:true', async () => {
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const promise = bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 5_000 })
+    await Promise.resolve()
+    const publishedEnv = nc.publishes[0]!.envelope as Envelope
+    const reply = {
+      envelope_version: 1, id: 'reply-uuid-2', from: 'kat', to: 'vec',
+      kind: 'result', in_reply_to: publishedEnv.id,
+      ts: '2026-08-27T00:00:00.000Z', payload: { done: true },
+    }
+    await bus.handleResult(reply)
+    const result = await promise
+    // Only the wait:true + reply-received path may claim delivery.
+    expect(result.delivered_to_subscriber).toBe(true)
+    expect(result.reply?.id).toBe('reply-uuid-2')
   })
 })
 

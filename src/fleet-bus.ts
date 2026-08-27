@@ -185,18 +185,40 @@ export function createHeartbeatEnvelope(
   }
 }
 
+class PayloadNotSerializableError extends Error {
+  constructor(message = 'payload contains an unserializable value') {
+    super(message)
+    this.name = 'PayloadNotSerializableError'
+  }
+}
+
 /**
- * Return true if `payload` will round-trip through `JSON.stringify`.
- * Rejects top-level `undefined`, functions, and symbols — all of which
- * `JSON.stringify` silently returns `undefined` for — plus `BigInt` and
- * anything with a hostile `toJSON` that throws.
+ * Return true if `payload` will round-trip through `JSON.stringify` with no
+ * fields silently disappearing. Rejects:
+ * - top-level `undefined` (JSON.stringify short-circuits without invoking the replacer)
+ * - top-level `function` / `symbol` (same short-circuit path)
+ * - ANY nested `undefined` / `function` / `symbol` / `bigint` (would be dropped from
+ *   the encoded envelope; `{ok: true, data: undefined}` becomes `{"ok":true}` and
+ *   the receiver's expectation quietly diverges from what the sender thinks it sent)
+ * - anything with a hostile `toJSON` that throws
  */
 export function payloadIsJsonSerializable(payload: unknown): boolean {
   if (payload === undefined) return false
-  const kind = typeof payload
-  if (kind === 'function' || kind === 'symbol') return false
+  const rootKind = typeof payload
+  if (rootKind === 'function' || rootKind === 'symbol' || rootKind === 'bigint') return false
   try {
-    return JSON.stringify(payload) !== undefined
+    JSON.stringify(payload, (_key, value) => {
+      if (
+        value === undefined ||
+        typeof value === 'function' ||
+        typeof value === 'symbol' ||
+        typeof value === 'bigint'
+      ) {
+        throw new PayloadNotSerializableError()
+      }
+      return value
+    })
+    return true
   } catch {
     return false
   }
@@ -763,16 +785,23 @@ export class FleetBus {
       return { ok: false, error: validation.error, envelope }
     }
     const subject = `fleet.${canonicalTo}.request`
+    // Local publish-side req_id per SPEC §8 — outbound audits must carry both
+    // envelope_id and req_id for cross-line correlation (mirrors bus.py:341).
+    const localReqId = randomBytes(16).toString('hex')
     try {
       this.nc.publish(subject, this.codec.encode(envelope))
     } catch (error) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'publish_failed', envelope_id: envelopeId, error: String(error) })
+      this.recordAudit({ dir: 'drop', subject, reason: 'publish_failed', envelope_id: envelopeId, req_id: localReqId, error: String(error) })
       return { ok: false, error: 'publish_failed', envelope }
     }
-    this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId })
+    this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId, req_id: localReqId })
 
     if (options.wait !== true) {
-      return { ok: true, envelope, delivered_to_subscriber: true }
+      // Core NATS publish does not confirm subscriber receipt; omit
+      // `delivered_to_subscriber` entirely so the caller can't misread
+      // "we published" as "someone consumed it". True is reserved for the
+      // wait: true path where a matching .result reply arrives.
+      return { ok: true, envelope }
     }
 
     const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
@@ -782,7 +811,7 @@ export class FleetBus {
         if (this.outboundLedger.has(envelopeId)) {
           this.outboundLedger.delete(envelopeId)
           this.evictedLedger.set(envelopeId, true)
-          this.recordAudit({ dir: 'drop', subject, reason: 'request_timeout', envelope_id: envelopeId })
+          this.recordAudit({ dir: 'drop', subject, reason: 'request_timeout', envelope_id: envelopeId, req_id: localReqId })
           resolve({ ok: false, timed_out: true, envelope })
         }
       }, timeoutMs)
