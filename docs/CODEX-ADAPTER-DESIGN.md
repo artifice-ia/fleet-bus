@@ -1,9 +1,18 @@
-# Codex-container fleet-bus adapter — design (v6)
+# Codex-container fleet-bus adapter — design (v7)
 
 **Target repo:** [`artifice-ia/codex-container`](https://github.com/artifice-ia/codex-container)
 **Implements:** [SPEC.md](../SPEC.md) for the Python side
 **Consumers who will run this:** Vec, Ohm, Myc, Helm
 **Status:** design draft, not yet implemented
+
+**Security correction in v7:** Baton attributes are transport-owned metadata.
+Model-written `<BUS>` tags may not set `root_id`, `origin`, `owner`, or `hops`;
+any such attribute rejects the whole tag with
+`codex_adapter_baton_field_in_tag`. Bus-triggered publishes inherit the three
+identity fields from the validated inbound envelope and increment `hops` in
+adapter code. Discord-triggered publishes mint the initial baton in adapter
+code. An inbound baton at `hops >= 16` is dropped before a model turn. This
+closes the loop-backstop reset described in codex-container issue #2.
 
 **Changes since v5** (in response to Codex re-review; Ohm's v5 review reposted v4 findings verbatim — treating as already-addressed):
 
@@ -23,7 +32,7 @@
 
 - **Backslash preservation in attribute parsing.** `\"` unescapes only when the outer attribute quote is `"` (and same for `'`). Any other `\<c>` passes through unchanged so JSON escapes (`\n`, `\t`, `\"` inside `'...'`-quoted attributes) survive to `json.loads`.
 - **Invalid `hops` skips the whole outbound tag.** The v3 `continue` only advanced the inner `BATON_FIELDS` loop; malformed envelope was still publishing without hops. Now flagged with a per-tag sentinel that continues the outer loop.
-- **Baton fields exposed in injection frame.** `_build_injection_frame` now emits `root_id`/`origin`/`owner`/`hops` as optional attributes when present on the inbound envelope. Field pass-through works both directions.
+- **Baton fields exposed in injection frame.** `_build_injection_frame` emits `root_id`/`origin`/`owner`/`hops` as optional attributes when present on the inbound envelope. v7 supersedes the original outbound-tag pass-through rule: outbound baton metadata comes only from trusted adapter context.
 - **Parser-generated drop audits carry `subject`/`req_id`.** `_find_bus_tags` and `_parse_attrs` take a `context` param threaded through from the caller.
 - **All adapter-specific audit reasons prefixed `codex_adapter_`.** SPEC §5 codes (unprefixed) reserved for the standardized reject taxonomy. Adapter-invented reasons (model_timeout, publish_error, envelope_frame_too_large, outbound_tag_*, prose_from_bus_turn_discarded, etc.) become `codex_adapter_<code>` per SPEC §8.
 
@@ -32,7 +41,7 @@
 Ohm v2 (5 findings):
 - Replies now route to `fleet.<to>.result`, not `.request` (SPEC §6)
 - `BUS_TAG_RE` replaced with quote-aware attribute parser; naive regex broke on payloads containing `>`
-- Baton additive fields (`root_id`, `origin`, `owner`, `hops`) preserved on outbound and passed through on inbound — per SPEC §14 "not in scope for baton semantics" but must not be dropped
+- Baton additive fields (`root_id`, `origin`, `owner`, `hops`) preserved on inbound per SPEC §2's additive extension. Outbound trust-boundary semantics are defined below; the prior reference to nonexistent SPEC §14 was incorrect.
 - Bus-triggered turns run ONLY the bus tag processor. `<CRON>`/`<CRON_REMOVE>` and other Discord-side capabilities are NOT exposed to bus turns; non-bus tags in bus-turn output are audited and discarded
 - Lifecycle switched from `bot.loop.create_task(...)` before `bot.run()` (unsafe on modern discord.py) to `setup_hook()` (the proper async startup hook), with task-handle retention and reconnect-idempotency
 
@@ -156,6 +165,15 @@ async def _on_bus_envelope(
     # ignored below.
     bus = bus_instance
 
+    # The adapter, not the model, owns the loop ceiling. Refuse exhausted or
+    # malformed counters before injecting anything into Codex.
+    hops = envelope.get("hops")
+    if hops is not None and (type(hops) is not int or hops < 0 or hops >= 16):
+        bus.audit({"dir": "drop", "subject": subject,
+                   "envelope_id": envelope.get("id"), "req_id": req_id,
+                   "reason": "codex_adapter_baton_hops_invalid"})
+        return
+
     try:
         frame = _build_injection_frame(envelope, req_id)
     except ValueError as e:
@@ -193,6 +211,7 @@ async def _on_bus_envelope(
         req_id=req_id,                # bus-triggered: reuse inbound nonce
         in_reply_to=envelope["id"],   # per §11, auto-set
         subject_context=subject,      # for audit events
+        baton_context=envelope,       # trusted transport-owned metadata
     )
 
     # Non-tag prose from a bus turn is discarded. Ohm v1 finding #2 still holds.
@@ -487,6 +506,33 @@ BATON_FIELDS = {"root_id", "origin", "owner", "hops"}
 _BOT_NAME_RE = re.compile(r"[a-z0-9_-]+")
 _NATS_SUBJECT_KIND_RE = re.compile(r"[a-z0-9_-]+(\.[a-z0-9_-]+)*")
 
+def _derive_baton_fields(env: dict, inbound: dict | None) -> dict:
+    """The single adapter-owned writer for every outbound baton field."""
+    if inbound is None:
+        fields = {
+            "root_id": env["id"], "origin": IDENTITY_NAME,
+            "owner": IDENTITY_NAME, "hops": 0,
+        }
+    else:
+        # Missing optional baton metadata cannot create an uncounted path.
+        # Derive it from validated core envelope fields and start counting.
+        fields = {
+            "root_id": inbound["root_id"] if "root_id" in inbound else inbound["id"],
+            "origin": inbound["origin"] if "origin" in inbound else inbound["from"],
+            "owner": inbound["owner"] if "owner" in inbound else inbound["from"],
+            "hops": inbound.get("hops", 0) + 1,
+        }
+    if fields["hops"] >= 16:
+        raise BatonDerivationError("codex_adapter_baton_hops_exhausted")
+    if env["kind"] == "baton.handoff":
+        recipient = normalize_bot_name(env.get("to"))
+        if recipient is None:
+            raise BatonDerivationError(
+                "codex_adapter_baton_handoff_recipient_invalid"
+            )
+        fields["owner"] = recipient
+    return fields
+
 def _pick_publish_subject(env: dict) -> str:
     """SPEC §6: replies go to fleet.<to>.result, requests go to fleet.<to>.request.
     Broadcasts (no `to`) go to fleet.broadcast.<kind>.
@@ -524,6 +570,7 @@ async def _process_bus_tags(
     req_id: str | None = None,
     in_reply_to: str | None = None,
     subject_context: str | None = None,
+    baton_context: dict | None = None,
 ) -> tuple[str, list[str]]:
     """Extract <BUS ... /> tags, publish each async with per-tag failure isolation.
     Returns (text-with-tags-removed, per-tag human-readable notes).
@@ -590,31 +637,31 @@ async def _process_bus_tags(
         elif in_reply_to:
             env["in_reply_to"] = in_reply_to
 
-        # Baton additive-field pass-through. The model can set these on
-        # the outbound tag; we preserve them without imposing semantics.
-        #
-        # v4 Codex #2 / Ohm #1: invalid hops MUST skip the whole tag,
-        # not just the inner baton loop. Use a per-tag sentinel; continue
-        # the outer tag loop on any baton parse failure.
-        baton_invalid = False
-        for baton_field in BATON_FIELDS:
-            if baton_field in attrs:
-                if baton_field == "hops":
-                    try:
-                        env["hops"] = int(attrs["hops"])
-                    except ValueError:
-                        notes.append(f"[bus tag ignored: hops not integer]")
-                        bus.audit({
-                            "dir": "drop", "subject": subject_context,
-                            "reason": "codex_adapter_outbound_baton_hops_not_integer",
-                            "req_id": req_id,
-                        })
-                        baton_invalid = True
-                        break
-                else:
-                    env[baton_field] = attrs[baton_field]
-        if baton_invalid:
-            continue  # skip the whole tag
+        # Baton metadata never comes from the model-written tag. Allowing
+        # hops="0" here lets the model reset the loop backstop on every hop;
+        # allowing root_id/origin/owner lets it rewrite chain identity and
+        # routing. Reject rather than silently ignore so the attempted trust-
+        # boundary violation remains visible in the audit log.
+        model_baton_fields = sorted(BATON_FIELDS.intersection(attrs))
+        if model_baton_fields:
+            notes.append("[bus tag ignored: baton fields are transport-owned]")
+            bus.audit({
+                "dir": "drop", "subject": subject_context,
+                "reason": "codex_adapter_baton_field_in_tag",
+                "fields": model_baton_fields, "req_id": req_id,
+            })
+            continue
+
+        try:
+            # All four paths (Discord/bus × handoff/other) use this one writer.
+            env.update(_derive_baton_fields(env, baton_context))
+        except BatonDerivationError as e:
+            bus.audit({
+                "dir": "drop", "subject": subject_context,
+                "reason": e.reason, "envelope_id": env["id"],
+                "req_id": req_id,
+            })
+            continue
 
         validation = bus.validate_outbound(env)  # applies SPEC §5 reject codes
         if not validation["ok"]:
@@ -690,7 +737,7 @@ async def _process_bus_tags(
 | §2 | to optional, string or null | Reject with `invalid_to` if present and not string/null |
 | §2 | in_reply_to optional, string | Reject with `invalid_in_reply_to` if present and not string |
 | §2 | Envelope ≤ 1,044,480 bytes encoded | Reject with `envelope_too_large`; enforce before publish (outbound) and on receive (inbound) |
-| §2 baton additive | root_id/origin/owner/hops accepted, not required | Preserved verbatim on inbound; passed through on outbound via BATON_FIELDS |
+| §2 baton additive | root_id/origin/owner/hops accepted, not required | Present inbound values are strictly schema-validated before model dispatch. One adapter-owned derivation function covers Discord/bus and handoff/other: missing values derive from validated core fields, handoff owner derives from recipient, and hops always exists and is ceiling-checked. Model-written baton tag attributes reject. |
 | §4 | from normalized (NFKC, lowercase, `[a-z0-9_-]+`) | Apply normalization then match against manifest allowlist; reject with `from_claim_rejected` |
 | §4 | Manifest allowlist load | Load `~/vault/infra/fleet-manifest.yaml` at connect; refuse to start if missing/empty |
 | §5 | Reject codes exact spelling | Use the exact strings from §5 in every audit event `reason` field |
