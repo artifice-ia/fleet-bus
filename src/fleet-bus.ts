@@ -114,7 +114,7 @@ export interface FleetBusRequestResult {
 export interface FleetBusReplyResult {
   ok: boolean
   envelope?: Envelope
-  error?: 'req_id_unknown' | 'multi_instance_publish_only' | string
+  error?: 'claude_discord_adapter_req_id_unknown' | 'claude_discord_adapter_multi_instance_publish_only' | string
   req_id?: string
 }
 
@@ -750,12 +750,12 @@ export class FleetBus {
 
   async request(options: FleetBusRequestOptions): Promise<FleetBusRequestResult> {
     if (this.mode === 'publish-only' && options.wait === true) {
-      return { ok: false, error: 'multi_instance_publish_only' }
+      return { ok: false, error: 'claude_discord_adapter_multi_instance_publish_only' }
     }
-    if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'fleet_bus_not_connected' }
+    if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected' }
 
     const canonicalTo = normalizeBotName(options.to)
-    if (canonicalTo === null) return { ok: false, error: 'invalid_recipient' }
+    if (canonicalTo === null) return { ok: false, error: 'claude_discord_adapter_invalid_recipient' }
     if (!payloadIsJsonSerializable(options.payload)) {
       this.recordAudit({
         dir: 'drop', subject: `fleet.${canonicalTo}.request`,
@@ -775,7 +775,7 @@ export class FleetBus {
         recipient: options.to,
       })
     } catch (error) {
-      const reason = error instanceof BatonDerivationError ? error.reason : 'baton_derivation_failed'
+      const reason = error instanceof BatonDerivationError ? error.reason : 'claude_discord_adapter_baton_derivation_failed'
       this.recordAudit({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason, envelope_id: envelopeId })
       return { ok: false, error: reason }
     }
@@ -801,8 +801,8 @@ export class FleetBus {
     try {
       this.nc.publish(subject, this.codec.encode(envelope))
     } catch (error) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'publish_failed', envelope_id: envelopeId, req_id: localReqId, error: String(error) })
-      return { ok: false, error: 'publish_failed', envelope }
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, req_id: localReqId, error: String(error) })
+      return { ok: false, error: 'claude_discord_adapter_publish_failed', envelope }
     }
     this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId, req_id: localReqId })
 
@@ -821,7 +821,7 @@ export class FleetBus {
         if (this.outboundLedger.has(envelopeId)) {
           this.outboundLedger.delete(envelopeId)
           this.evictedLedger.set(envelopeId, true)
-          this.recordAudit({ dir: 'drop', subject, reason: 'request_timeout', envelope_id: envelopeId, req_id: localReqId })
+          this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_request_timeout', envelope_id: envelopeId, req_id: localReqId })
           resolve({ ok: false, timed_out: true, envelope })
         }
       }, timeoutMs)
@@ -837,11 +837,11 @@ export class FleetBus {
 
   publishReply(reqId: string, payload: unknown, kind = 'result'): FleetBusReplyResult {
     if (this.mode === 'publish-only') {
-      return { ok: false, error: 'multi_instance_publish_only', req_id: reqId }
+      return { ok: false, error: 'claude_discord_adapter_multi_instance_publish_only', req_id: reqId }
     }
-    if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'fleet_bus_not_connected', req_id: reqId }
+    if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected', req_id: reqId }
     const inbound = this.receiveLedger.get(reqId)
-    if (inbound === undefined) return { ok: false, error: 'req_id_unknown', req_id: reqId }
+    if (inbound === undefined) return { ok: false, error: 'claude_discord_adapter_req_id_unknown', req_id: reqId }
     if (!payloadIsJsonSerializable(payload)) {
       this.recordAudit({
         dir: 'drop', subject: `fleet.${inbound.from}.result`,
@@ -861,7 +861,7 @@ export class FleetBus {
         recipient: inbound.from,
       })
     } catch (error) {
-      const reason = error instanceof BatonDerivationError ? error.reason : 'baton_derivation_failed'
+      const reason = error instanceof BatonDerivationError ? error.reason : 'claude_discord_adapter_baton_derivation_failed'
       this.recordAudit({ dir: 'drop', subject: `fleet.${inbound.from}.result`, reason, envelope_id: envelopeId })
       return { ok: false, error: reason, req_id: reqId }
     }
@@ -886,8 +886,8 @@ export class FleetBus {
     try {
       this.nc.publish(subject, this.codec.encode(envelope))
     } catch (error) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'publish_failed', envelope_id: envelopeId, error: String(error) })
-      return { ok: false, error: 'publish_failed', req_id: reqId, envelope }
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, error: String(error) })
+      return { ok: false, error: 'claude_discord_adapter_publish_failed', req_id: reqId, envelope }
     }
     this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId, req_id: reqId })
     return { ok: true, envelope, req_id: reqId }
@@ -903,7 +903,7 @@ export class FleetBus {
     try {
       decoded = this.codec.decode(message.data)
     } catch {
-      this.recordAudit({ dir: 'drop', subject, reason: 'malformed_json' })
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' })
       return
     }
     const result = validateEnvelope(
@@ -948,7 +948,7 @@ export class FleetBus {
     // Single dir:in audit per received envelope (dedup fix, round-3 P2).
     this.recordAudit({ dir: 'in', subject, envelope_id: result.envelope.id, req_id: reqId })
     await this.injectIntoSession({ envelope: result.envelope, reqId }).catch(error => {
-      this.recordAudit({ dir: 'drop', subject, reason: 'injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
     })
   }
 
@@ -962,7 +962,7 @@ export class FleetBus {
     try {
       decoded = this.codec.decode(message.data)
     } catch {
-      this.recordAudit({ dir: 'drop', subject, reason: 'malformed_json' })
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' })
       return
     }
     const validation = validateEnvelope(
@@ -981,7 +981,7 @@ export class FleetBus {
       this.recordAudit({
         dir: 'drop',
         subject,
-        reason: 'misrouted_reply',
+        reason: 'claude_discord_adapter_misrouted_reply',
         envelope_id: envelope.id,
       })
       return
@@ -1020,7 +1020,7 @@ export class FleetBus {
         this.recordAudit({
           dir: 'drop',
           subject,
-          reason: 'reply_from_mismatch',
+          reason: 'claude_discord_adapter_reply_from_mismatch',
           envelope_id: envelope.id,
           req_id: match.reqId,
           expected_from: match.expectedFrom,
@@ -1054,11 +1054,11 @@ export class FleetBus {
       subject,
       envelope_id: envelope.id,
       req_id: reqId,
-      note: lateReplyEnvId !== undefined ? 'late_reply' : 'unsolicited_reply',
+      note: lateReplyEnvId !== undefined ? 'claude_discord_adapter_late_reply' : 'claude_discord_adapter_unsolicited_reply',
       ...(lateReplyEnvId !== undefined ? { late_reply_env_id: lateReplyEnvId } : {}),
     })
     await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId }).catch(error => {
-      this.recordAudit({ dir: 'drop', subject, reason: 'injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
     })
   }
 
@@ -1078,11 +1078,11 @@ export class FleetBus {
     this.recordAudit({
       dir: 'drop',
       subject: `fleet.${entry.envelope.to}.request`,
-      reason: 'ledger_overflow',
+      reason: 'claude_discord_adapter_ledger_overflow',
       envelope_id: entry.envelope.id,
       req_id: entry.reqId,
     })
-    entry.resolve({ ok: false, error: 'ledger_overflow', envelope: entry.envelope })
+    entry.resolve({ ok: false, error: 'claude_discord_adapter_ledger_overflow', envelope: entry.envelope })
   }
 
   private subscribe(subject: string, handler: (message: Msg) => void | Promise<void>): void {
@@ -1121,11 +1121,28 @@ export class FleetBus {
 
   /**
    * Dispatch the envelope to the session callback. Deliberately does NOT
-   * audit here — every caller writes exactly one `dir: in` audit BEFORE
-   * calling this method, so unsolicited/late replies can carry their
-   * `note` field without producing a duplicate audit entry (P2 round 3).
+   * write the primary `dir: in` audit here — every caller writes exactly
+   * one `dir: in` BEFORE calling this method, so unsolicited/late replies
+   * can carry their `note` field without producing a duplicate audit entry
+   * (P2 round 3).
+   *
+   * DOES persist the full payload as a `dir: meta` audit line WHEN the
+   * standard 8KB body cap would truncate — the injection frame's marker
+   * (`[...full envelope in audit log env_id=<id>]`) is only a truthful
+   * promise if the full envelope is actually somewhere in the audit log
+   * (P2 round 4).
    */
   private async injectIntoSession(event: FleetBusSessionEvent): Promise<void> {
+    const { truncated } = buildFleetBusFramePayloadBody(event.envelope)
+    if (truncated) {
+      this.recordAudit({
+        dir: 'meta',
+        reason: 'claude_discord_adapter_payload_body_truncated',
+        envelope_id: event.envelope.id,
+        req_id: event.reqId,
+        payload_full: JSON.stringify(event.envelope.payload) ?? 'null',
+      })
+    }
     if (!this.config.injectIntoSession) {
       this.log(`received ${event.envelope.kind} from ${event.envelope.from}; session injection is not configured`)
       return

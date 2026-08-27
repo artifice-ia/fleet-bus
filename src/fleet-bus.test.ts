@@ -431,7 +431,7 @@ describe('request session injection', () => {
     // First reqId should now be evicted — publishReply on it returns req_id_unknown.
     const first = events[0]!.reqId
     const result = bus.publishReply(first, {})
-    expect(result.error).toBe('req_id_unknown')
+    expect(result.error).toBe('claude_discord_adapter_req_id_unknown')
   })
 
   test('populates the receive ledger keyed by the local reqId', async () => {
@@ -446,7 +446,7 @@ describe('request session injection', () => {
     // (although publish will fail with fleet_bus_not_connected — that's OK, it
     // proves the ledger lookup succeeded).
     const reply = bus.publishReply(events[0]!.reqId, { ok: true })
-    expect(reply.error).toBe('fleet_bus_not_connected')
+    expect(reply.error).toBe('claude_discord_adapter_fleet_bus_not_connected')
   })
 })
 
@@ -659,7 +659,7 @@ describe('request / publishReply / onResult', () => {
 
     const r1 = await p1
     expect(r1.ok).toBe(false)
-    expect(r1.error).toBe('ledger_overflow')
+    expect(r1.error).toBe('claude_discord_adapter_ledger_overflow')
     // Evicted id is tracked so a later reply arriving surfaces as a late-reply.
     expect(bus.evictedLedgerHas(r1.envelope!.id)).toBe(true)
     // p2 and p3 remain pending in the ledger; we don't await them here.
@@ -674,7 +674,7 @@ describe('request / publishReply / onResult', () => {
     bus.attachFakeNc(nc)
     const result = bus.publishReply('never-received-nonce', { ok: true })
     expect(result.ok).toBe(false)
-    expect(result.error).toBe('req_id_unknown')
+    expect(result.error).toBe('claude_discord_adapter_req_id_unknown')
     expect(nc.publishes).toHaveLength(0)
   })
 
@@ -851,8 +851,8 @@ describe('request / publishReply / onResult', () => {
     const p2 = bus.request({ to: 'kat', kind: 'text_message', payload: { i: 2 }, wait: true, timeoutMs: 5_000 })
     void p2.then(() => {}, () => {})
     const r1 = await p1
-    expect(r1.error).toBe('ledger_overflow')
-    const overflowEntry = readAudit(auditLogPath).find(e => e.reason === 'ledger_overflow')
+    expect(r1.error).toBe('claude_discord_adapter_ledger_overflow')
+    const overflowEntry = readAudit(auditLogPath).find(e => e.reason === 'claude_discord_adapter_ledger_overflow')
     expect(overflowEntry).toBeDefined()
     expect(typeof overflowEntry!.req_id).toBe('string')
     expect(overflowEntry!.envelope_id).toBe(r1.envelope!.id)
@@ -896,7 +896,52 @@ describe('request / publishReply / onResult', () => {
     )
     // Exactly ONE audit entry, carrying the unsolicited_reply note.
     expect(inEntries).toHaveLength(1)
-    expect(inEntries[0]!.note).toBe('unsolicited_reply')
+    expect(inEntries[0]!.note).toBe('claude_discord_adapter_unsolicited_reply')
+  })
+
+  test('body-cap truncation persists the full payload to the audit log (marker promise)', async () => {
+    // Truncation happens when the ESCAPED body would exceed 8KB — 3KB of `&`
+    // (each escapes to `&amp;`, 5×) is enough to force the truncation path.
+    const rawPayload = { blob: '&'.repeat(3_000), tag: 'over-cap' }
+    const rawEncoded = JSON.stringify(rawPayload)
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    await bus.handleRequest(envelope({ from: 'ohm', id: 'wire-trunc-1', payload: rawPayload }))
+    expect(events).toHaveLength(1)
+
+    const entries = readAudit(auditLogPath)
+    const meta = entries.find(e => e.reason === 'claude_discord_adapter_payload_body_truncated')
+    expect(meta).toBeDefined()
+    expect(meta!.dir).toBe('meta')
+    expect(meta!.envelope_id).toBe('wire-trunc-1')
+    expect(typeof meta!.req_id).toBe('string')
+    // The marker in the frame promises `env_id=<id>`; verify the persisted
+    // audit line carries the FULL serialized payload keyed by that env_id.
+    expect(meta!.payload_full).toBe(rawEncoded)
+
+    // Verify the frame the plugin will build actually references this env_id
+    // in its truncation marker, so the audit line and the marker line up.
+    const frame = buildFleetBusFrame({ envelope: envelope({ id: 'wire-trunc-1', payload: rawPayload }) as Envelope, reqId: 'r' })
+    expect(frame).toContain('env_id=wire-trunc-1')
+  })
+
+  test('body-cap NON-truncation writes NO meta audit line', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    await bus.handleRequest(envelope({ from: 'ohm', id: 'wire-small', payload: { hi: true } }))
+    expect(events).toHaveLength(1)
+    const meta = readAudit(auditLogPath).find(e => e.reason === 'claude_discord_adapter_payload_body_truncated')
+    expect(meta).toBeUndefined()
   })
 })
 
@@ -917,7 +962,7 @@ describe('onResult inject path', () => {
     }
     await bus.handleResult(reply)
     expect(events).toHaveLength(0)
-    expect(readAudit(auditLogPath).some(e => e.reason === 'misrouted_reply')).toBe(true)
+    expect(readAudit(auditLogPath).some(e => e.reason === 'claude_discord_adapter_misrouted_reply')).toBe(true)
   })
 
   test('from mismatch audits reply_from_mismatch, injects as unsolicited, does not resolve waiter', async () => {
@@ -950,7 +995,7 @@ describe('onResult inject path', () => {
     expect(events).toHaveLength(1)
     expect(events[0]!.unsolicited).toBe(true)
     // Audit contains reply_from_mismatch.
-    expect(readAudit(auditLogPath).some(e => e.reason === 'reply_from_mismatch')).toBe(true)
+    expect(readAudit(auditLogPath).some(e => e.reason === 'claude_discord_adapter_reply_from_mismatch')).toBe(true)
   })
 
   test('unsolicited reply (no ledger match, no evicted match) injects with no lateReplyEnvId', async () => {
@@ -1160,7 +1205,7 @@ describe('publish-only mode', () => {
     await bus.connect()
     const result = bus.publishReply('any', {})
     expect(result.ok).toBe(false)
-    expect(result.error).toBe('multi_instance_publish_only')
+    expect(result.error).toBe('claude_discord_adapter_multi_instance_publish_only')
     await bus.disconnect()
   })
 
@@ -1174,7 +1219,7 @@ describe('publish-only mode', () => {
     await bus.connect()
     const result = await bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true })
     expect(result.ok).toBe(false)
-    expect(result.error).toBe('multi_instance_publish_only')
+    expect(result.error).toBe('claude_discord_adapter_multi_instance_publish_only')
     await bus.disconnect()
   })
 
