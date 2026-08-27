@@ -350,6 +350,15 @@ class TestFleetBus extends FleetBus {
   evictedLedgerHas(id: string): boolean {
     return (this as unknown as { evictedLedger: { has: (k: string) => boolean } }).evictedLedger.has(id)
   }
+  seenResultLedgerSize(): number {
+    return (this as unknown as { seenResultEnvelopes: { size: number } }).seenResultEnvelopes.size
+  }
+  seenResultLedgerHas(id: string): boolean {
+    return (this as unknown as { seenResultEnvelopes: { has: (k: string) => boolean } }).seenResultEnvelopes.has(id)
+  }
+  seenRequestLedgerHas(id: string): boolean {
+    return (this as unknown as { seenRequestEnvelopes: { has: (k: string) => boolean } }).seenRequestEnvelopes.has(id)
+  }
 }
 
 describe('request session injection', () => {
@@ -1138,6 +1147,186 @@ describe('onResult inject path', () => {
     expect(events).toHaveLength(1)
     expect(events[0]!.unsolicited).toBe(true)
     expect(events[0]!.lateReplyEnvId).toBe(originalId)
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* Envelope-id dedup (round-8 P2)                                              */
+/* -------------------------------------------------------------------------- */
+
+describe('envelope-id dedup', () => {
+  test('duplicate .result after ledger match — first resolves waiter, second drops as duplicate', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const nc = new FakeNatsConnection()
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      injectIntoSession: async e => { events.push(e) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    const promise = bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 5_000 })
+    await Promise.resolve()
+    const publishedEnv = nc.publishes[0]!.envelope as Envelope
+
+    const reply = {
+      envelope_version: 1, id: 'dup-r-1', from: 'kat', to: 'vec',
+      kind: 'result', in_reply_to: publishedEnv.id,
+      ts: '2026-08-27T00:00:00.000Z', payload: { done: true },
+    }
+    await bus.handleResult(reply)
+    // First arrival resolves the waiter (ledger-matched, no inject).
+    const outcome = await promise
+    expect(outcome.ok).toBe(true)
+    expect(outcome.reply?.id).toBe('dup-r-1')
+    expect(events).toHaveLength(0)
+    expect(bus.seenResultLedgerHas('dup-r-1')).toBe(true)
+
+    // Retry: peer re-sends the same envelope. Must drop as duplicate — must
+    // NOT inject as unsolicited (which is what the pre-fix behavior did once
+    // the outbound ledger entry was deleted by the first arrival).
+    await bus.handleResult(reply)
+    expect(events).toHaveLength(0)
+    const drops = readAudit(auditLogPath).filter(e => e.reason === 'claude_discord_adapter_duplicate_result_envelope')
+    expect(drops).toHaveLength(1)
+    expect(drops[0]!.envelope_id).toBe('dup-r-1')
+    // Correlation: the drop audit carries the ORIGINAL request's req_id so
+    // operators can trace the retry back to the resolved turn.
+    const outEntry = readAudit(auditLogPath).find(e => e.dir === 'out')
+    expect(outEntry).toBeDefined()
+    expect(drops[0]!.req_id).toBe(outEntry!.req_id)
+  })
+
+  test('duplicate unsolicited .result — first injects, second drops as duplicate (does NOT re-inject)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const nc = new FakeNatsConnection()
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      injectIntoSession: async e => { events.push(e) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    const reply = {
+      envelope_version: 1, id: 'dup-r-unsol-1', from: 'kat', to: 'vec',
+      kind: 'result', in_reply_to: 'never-was-in-flight',
+      ts: '2026-08-27T00:00:00.000Z', payload: {},
+    }
+    // First arrival — hits no-match branch, injects as unsolicited.
+    await bus.handleResult(reply)
+    expect(events).toHaveLength(1)
+    expect(events[0]!.unsolicited).toBe(true)
+    const firstReqId = events[0]!.reqId
+
+    // Retry — must drop. The pre-fix behavior would inject a SECOND time
+    // with a fresh reqId, burning per-session-inject budget.
+    await bus.handleResult(reply)
+    expect(events).toHaveLength(1) // still 1
+    const drops = readAudit(auditLogPath).filter(e => e.reason === 'claude_discord_adapter_duplicate_result_envelope')
+    expect(drops).toHaveLength(1)
+    expect(drops[0]!.envelope_id).toBe('dup-r-unsol-1')
+    expect(drops[0]!.req_id).toBe(firstReqId)
+  })
+
+  test('seenResult ledger is bounded — envelopes evicted past cap can re-inject (mutation witness)', async () => {
+    // Mutation witness: if the seen ledger were unbounded, ANY duplicate ever
+    // would drop; if the cap were bypassed, the same. Fill to cap+1, verify
+    // the first envelope's id has evicted, and its duplicate re-injects.
+    const nc = new FakeNatsConnection()
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      seenResultLedgerCap: 2,
+      injectIntoSession: async e => { events.push(e) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    const makeReply = (id: string) => ({
+      envelope_version: 1, id, from: 'kat', to: 'vec',
+      kind: 'result', in_reply_to: `unmatched-${id}`,
+      ts: '2026-08-27T00:00:00.000Z', payload: {},
+    })
+
+    await bus.handleResult(makeReply('cap-a'))
+    await bus.handleResult(makeReply('cap-b'))
+    await bus.handleResult(makeReply('cap-c')) // evicts 'cap-a' from seen ledger
+    expect(events).toHaveLength(3)
+    expect(bus.seenResultLedgerHas('cap-a')).toBe(false)
+    expect(bus.seenResultLedgerHas('cap-b')).toBe(true)
+    expect(bus.seenResultLedgerHas('cap-c')).toBe(true)
+
+    // Duplicate of 'cap-a' — the seen entry has evicted, so this re-injects.
+    // (Unbounded dedup would still block it; broken dedup would block it too.
+    // Only a bounded-LRU dedup lets this through as expected.)
+    await bus.handleResult(makeReply('cap-a'))
+    expect(events).toHaveLength(4)
+    expect(events[3]!.envelope.id).toBe('cap-a')
+
+    // Duplicate of 'cap-c' — still in seen ledger, must drop.
+    await bus.handleResult(makeReply('cap-c'))
+    expect(events).toHaveLength(4)
+  })
+
+  test('late-reply duplicate — first tags lateReplyEnvId, second drops (does NOT re-inject untagged)', async () => {
+    // Regression: the evictedLedger is deleted on first late-reply arrival,
+    // so a naive re-check on the second arrival would find no evicted match
+    // and inject as a plain unsolicited (WITHOUT the late-reply tag) —
+    // giving the model two conflicting views of the same wire envelope.
+    const nc = new FakeNatsConnection()
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async e => { events.push(e) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    const first = await bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 20 })
+    expect(first.timed_out).toBe(true)
+    const originalId = first.envelope!.id
+    expect(bus.evictedLedgerHas(originalId)).toBe(true)
+
+    const reply = {
+      envelope_version: 1, id: 'late-dup-1', from: 'kat', to: 'vec',
+      kind: 'result', in_reply_to: originalId,
+      ts: '2026-08-27T00:00:00.000Z', payload: {},
+    }
+    await bus.handleResult(reply)
+    expect(events).toHaveLength(1)
+    expect(events[0]!.lateReplyEnvId).toBe(originalId)
+
+    // Retry: without the seen-ledger dedup, this would inject a SECOND time
+    // with lateReplyEnvId undefined (evictedLedger was consumed by first).
+    await bus.handleResult(reply)
+    expect(events).toHaveLength(1)
+  })
+
+  test('duplicate .request — first injects, second drops (class-widened from onResult)', async () => {
+    // Class-widening per feedback_class_vs_instance: onRequest mints a fresh
+    // reqId on every retry the same way onResult did. Same-shape fix on a
+    // separate ledger.
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      injectIntoSession: async e => { events.push(e) },
+    }, allowlist)
+
+    const value = envelope({ from: 'ohm', id: 'dup-req-1' })
+    await bus.handleRequest(value)
+    expect(events).toHaveLength(1)
+    const firstReqId = events[0]!.reqId
+    expect(bus.seenRequestLedgerHas('dup-req-1')).toBe(true)
+
+    // Retry — must drop as duplicate. Pre-fix: fresh reqId, second inject.
+    await bus.handleRequest(value)
+    expect(events).toHaveLength(1)
+    const drops = readAudit(auditLogPath).filter(e => e.reason === 'claude_discord_adapter_duplicate_request_envelope')
+    expect(drops).toHaveLength(1)
+    expect(drops[0]!.envelope_id).toBe('dup-req-1')
+    expect(drops[0]!.req_id).toBe(firstReqId)
   })
 })
 

@@ -15,6 +15,8 @@ export const DEFAULT_MAX_ENVELOPE_BYTES = 1_044_480
 export const DEFAULT_INFLIGHT_LEDGER_CAP = 1000
 export const DEFAULT_RECEIVE_LEDGER_CAP = 1000
 export const DEFAULT_EVICTED_LEDGER_CAP = 1000
+export const DEFAULT_SEEN_RESULT_LEDGER_CAP = 1000
+export const DEFAULT_SEEN_REQUEST_LEDGER_CAP = 1000
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 export const DEFAULT_ATTR_MAX_LEN = 1024
 export const DEFAULT_PAYLOAD_BODY_MAX_BYTES = 8192
@@ -52,6 +54,8 @@ export interface FleetBusConfig {
   inflightLedgerCap?: number
   receiveLedgerCap?: number
   evictedLedgerCap?: number
+  seenResultLedgerCap?: number
+  seenRequestLedgerCap?: number
   rateLimiters?: FleetBusRateLimiters
   supervisorSleepMs?: number
   /**
@@ -618,6 +622,12 @@ export class FleetBus {
   private readonly outboundLedger: BoundedLru<string, InflightEntry>
   private readonly receiveLedger: BoundedLru<string, Envelope>
   private readonly evictedLedger: BoundedLru<string, true>
+  // Envelope-id dedup ledgers (round-8 P2): peers can retry the same wire
+  // envelope; without this both the .result and .request handlers happily
+  // re-inject each retry as a fresh session turn. Storing the reqId used at
+  // first-handle lets the drop audit correlate back to the original turn.
+  private readonly seenResultEnvelopes: BoundedLru<string, { reqId: string; ts: number }>
+  private readonly seenRequestEnvelopes: BoundedLru<string, { reqId: string; ts: number }>
   private readonly rateLimiters: FleetBusRateLimiters
   private readonly connectFn: (options: ConnectionOptions) => Promise<NatsConnection>
   private supervisorStopping = false
@@ -636,6 +646,12 @@ export class FleetBus {
     )
     this.receiveLedger = new BoundedLru<string, Envelope>(config.receiveLedgerCap ?? DEFAULT_RECEIVE_LEDGER_CAP)
     this.evictedLedger = new BoundedLru<string, true>(config.evictedLedgerCap ?? DEFAULT_EVICTED_LEDGER_CAP)
+    this.seenResultEnvelopes = new BoundedLru<string, { reqId: string; ts: number }>(
+      config.seenResultLedgerCap ?? DEFAULT_SEEN_RESULT_LEDGER_CAP,
+    )
+    this.seenRequestEnvelopes = new BoundedLru<string, { reqId: string; ts: number }>(
+      config.seenRequestLedgerCap ?? DEFAULT_SEEN_REQUEST_LEDGER_CAP,
+    )
   }
 
   async connect(): Promise<void> {
@@ -933,6 +949,24 @@ export class FleetBus {
       })
       return
     }
+    // Envelope-id dedup (round-8 P2, class-widened from onResult). Peers can
+    // retry `.request` frames for the same reasons they retry `.result` —
+    // transport re-send, publisher restart, back-off retries. Without this
+    // gate the retry mints a fresh reqId and injects as a second session
+    // turn. Separate ledger from seenResultEnvelopes so a peer with the same
+    // wire id on both subjects (protocol violation, but possible) can't
+    // silently swallow one side.
+    const seenRequest = this.seenRequestEnvelopes.get(result.envelope.id)
+    if (seenRequest !== undefined) {
+      this.recordAudit({
+        dir: 'drop',
+        subject,
+        reason: 'claude_discord_adapter_duplicate_request_envelope',
+        envelope_id: result.envelope.id,
+        req_id: seenRequest.reqId,
+      })
+      return
+    }
     if (!this.rateLimiters.perSessionInject.allow('session')) {
       this.recordAudit({
         dir: 'drop',
@@ -944,6 +978,7 @@ export class FleetBus {
     }
 
     const reqId = randomBytes(16).toString('hex')
+    this.seenRequestEnvelopes.set(result.envelope.id, { reqId, ts: Date.now() })
     this.receiveLedger.set(reqId, result.envelope)
     // Single dir:in audit per received envelope (dedup fix, round-3 P2).
     this.recordAudit({ dir: 'in', subject, envelope_id: result.envelope.id, req_id: reqId })
@@ -1006,6 +1041,29 @@ export class FleetBus {
       return
     }
 
+    // Envelope-id dedup (round-8 P2): peers can retry a `.result` for many
+    // reasons (transport re-send, publisher restart). Without this gate, the
+    // first copy resolves the waiter + drops out of the inflight ledger, then
+    // the second copy hits the no-match branch and injects as a fresh
+    // unsolicited turn with a NEW reqId. The evictedLedger doesn't help — it
+    // was already consumed by the first arrival. Bounded envelope-id ledger
+    // catches both the ledger-matched retry AND the unsolicited retry AND the
+    // late-reply retry (which would otherwise re-inject without the late-reply
+    // tag on the second arrival). Runs AFTER validate/recipient/rate-limit
+    // gates so a flood of duplicates from a bad peer still hits per-from/
+    // per-subject limits first.
+    const seenResult = this.seenResultEnvelopes.get(envelope.id)
+    if (seenResult !== undefined) {
+      this.recordAudit({
+        dir: 'drop',
+        subject,
+        reason: 'claude_discord_adapter_duplicate_result_envelope',
+        envelope_id: envelope.id,
+        req_id: seenResult.reqId,
+      })
+      return
+    }
+
     const inReplyTo = envelope.in_reply_to
     if (inReplyTo !== undefined) {
       const match = this.outboundLedger.get(inReplyTo)
@@ -1018,6 +1076,9 @@ export class FleetBus {
           // (reply-to-request) survives.
           clearTimeout(match.timerId)
           this.outboundLedger.delete(inReplyTo)
+          // Record BEFORE resolve so a synchronous consumer that re-enters
+          // handleResult on the same envelope sees the dedup gate armed.
+          this.seenResultEnvelopes.set(envelope.id, { reqId: match.reqId, ts: Date.now() })
           this.recordAudit({
             dir: 'in', subject, envelope_id: envelope.id,
             req_id: match.reqId, note: 'claude_discord_adapter_ledger_matched',
@@ -1058,6 +1119,10 @@ export class FleetBus {
       return
     }
     const reqId = randomBytes(16).toString('hex')
+    // Round-8 P2: any inject path that reaches this line has committed a
+    // session turn to this envelope; a duplicate arriving later must be
+    // deduped so we don't burn another turn on the same wire id.
+    this.seenResultEnvelopes.set(envelope.id, { reqId, ts: Date.now() })
     this.receiveLedger.set(reqId, envelope)
     this.recordAudit({
       dir: 'in',
