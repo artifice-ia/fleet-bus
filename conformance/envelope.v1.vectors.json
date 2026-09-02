@@ -1,0 +1,768 @@
+{
+  "$comment": "Normative cross-implementation conformance vectors for the fleet-bus v1 envelope. See conformance/README.md for the contract a runner must satisfy. Additive-only: appending vectors is a minor change, altering or deleting one is a breaking change and requires a SPEC.md revision.",
+  "vectors_version": 1,
+  "envelope_version": 1,
+  "allowed_from": [
+    "deet",
+    "vec",
+    "ohm",
+    "kat",
+    "luna",
+    "myc",
+    "chis"
+  ],
+  "max_bytes": 1044480,
+  "vectors": [
+    {
+      "name": "accept/minimal",
+      "why": "The smallest envelope that satisfies every required field.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e1",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/null-payload",
+      "why": "`payload` is required to be PRESENT, not truthy. JSON null is a legal payload.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e2",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": null
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/scalar-payload",
+      "why": "`payload` is arbitrary JSON, not necessarily an object.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e3",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": 42
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/unknown-field-ignored",
+      "why": "SPEC clause 1: v1 is additive-only and consumers MUST ignore unknown fields rather than reject.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e4",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "future_field": {
+          "nested": true
+        }
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/unknown-kind",
+      "why": "Schema: unknown kinds are logged, not rejected. Only an empty or non-string kind is invalid.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e5",
+        "from": "deet",
+        "kind": "not_a_standard_kind",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/to-null-is-broadcast",
+      "why": "Null or absent `to` means broadcast; the subject determines the audience.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e6",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "to": null
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/from-normalized-case",
+      "why": "`from` is NFKC-lowercased before the allowlist check; the accepted envelope carries the canonical form.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e7",
+        "from": "DEET",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "accept",
+      "normalized_from": "deet"
+    },
+    {
+      "name": "accept/from-normalized-fullwidth",
+      "why": "NFKC folds fullwidth Latin to ASCII, so a fullwidth claim is the same identity — not a separate one that slips the allowlist.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e8",
+        "from": "ｄｅｅｔ",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "accept",
+      "normalized_from": "deet"
+    },
+    {
+      "name": "accept/ts-offset-positive",
+      "why": "RFC 3339 numeric offsets are valid, not only the Z form.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e9",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-01T18:00:00-06:00",
+        "payload": {}
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/ts-fractional-seconds",
+      "why": "Sub-second precision is common in generated timestamps and must not be rejected.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e10",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00.123456Z",
+        "payload": {}
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/baton-complete",
+      "why": "A full, self-consistent baton frame at hop zero.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e11",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "e11",
+        "origin": "deet",
+        "owner": "vec",
+        "hops": 0
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/baton-hops-at-warn-threshold",
+      "why": "Hop 8 triggers a warning to `origin`; it is explicitly NOT a rejection. Guards against a warn threshold being implemented as a ceiling.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e12",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r1",
+        "origin": "deet",
+        "owner": "vec",
+        "hops": 8
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/baton-hops-just-under-ceiling",
+      "why": "The ceiling is at 16 and is exclusive-below: 15 is the last legal value. Guards an off-by-one in the wrong direction.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e13",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r1",
+        "origin": "deet",
+        "owner": "vec",
+        "hops": 15
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/no-baton-fields",
+      "why": "Baton fields are a v1.x additive extension. Their absence is legal and must not synthesize defaults during validation.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "e14",
+        "from": "deet",
+        "kind": "status_ping",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "accept"
+    },
+    {
+      "name": "accept/at-size-limit",
+      "why": "The size check is `>` max_bytes, not `>=`. An envelope encoding to exactly max_bytes is legal. Generated so the boundary is real rather than approximated.",
+      "envelope_generator": "pad_to_exact_bytes",
+      "expect": "accept"
+    },
+    {
+      "name": "reject/not-an-object",
+      "why": "A JSON array is not an envelope. Guards implementations whose object test is a bare typeof/isinstance that arrays satisfy.",
+      "envelope_raw": [],
+      "expect": "reject",
+      "reason": "envelope_not_object"
+    },
+    {
+      "name": "reject/null-envelope",
+      "why": "JSON null passes a naive `typeof === 'object'` test.",
+      "envelope_raw": null,
+      "expect": "reject",
+      "reason": "envelope_not_object"
+    },
+    {
+      "name": "reject/string-envelope",
+      "why": "A bare JSON string decodes successfully and must still be refused.",
+      "envelope_raw": "not an envelope",
+      "expect": "reject",
+      "reason": "envelope_not_object"
+    },
+    {
+      "name": "reject/version-2",
+      "why": "A future major version must be refused with its own reason, not silently parsed as v1.",
+      "envelope": {
+        "envelope_version": 2,
+        "id": "r1",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "unsupported_envelope_version"
+    },
+    {
+      "name": "reject/version-string-one",
+      "why": "`\"1\"` is not 1. Guards a loose-equality version check.",
+      "envelope": {
+        "envelope_version": "1",
+        "id": "r2",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "unsupported_envelope_version"
+    },
+    {
+      "name": "reject/version-missing",
+      "why": "Absent is not 1.",
+      "envelope": {
+        "id": "r3",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "unsupported_envelope_version"
+    },
+    {
+      "name": "reject/id-empty",
+      "why": "An empty id defeats dedup and audit correlation, so it is refused rather than tolerated.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "invalid_id"
+    },
+    {
+      "name": "reject/id-non-string",
+      "why": "A numeric id would compare unequal to its string form in the dedup ledger.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": 7,
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "invalid_id"
+    },
+    {
+      "name": "reject/kind-empty",
+      "why": "Kind selects the payload semantics; empty means the receiver cannot know what it holds.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r4",
+        "from": "deet",
+        "kind": "",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "invalid_kind"
+    },
+    {
+      "name": "reject/ts-not-a-date",
+      "why": "An unparseable timestamp is refused by both implementations and anchors the reason name.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r5",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "banana",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "invalid_ts"
+    },
+    {
+      "name": "reject/ts-non-string",
+      "why": "An epoch integer is a plausible sender mistake and must not be coerced.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r6",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": 1788000000,
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "invalid_ts"
+    },
+    {
+      "name": "reject/payload-absent",
+      "why": "Presence, not truthiness: this vector differs from accept/null-payload by the KEY, not the value.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r7",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z"
+      },
+      "expect": "reject",
+      "reason": "missing_payload"
+    },
+    {
+      "name": "reject/to-non-string",
+      "why": "`to` is a bot name or null; a number would silently fail every recipient comparison instead of erroring.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r8",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "to": 3
+      },
+      "expect": "reject",
+      "reason": "invalid_to"
+    },
+    {
+      "name": "reject/in-reply-to-non-string",
+      "why": "Same class as `to`: a non-string correlation key never matches and never errors.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r9",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "in_reply_to": 12
+      },
+      "expect": "reject",
+      "reason": "invalid_in_reply_to"
+    },
+    {
+      "name": "reject/in-reply-to-null",
+      "why": "Null is NOT the absent form for `in_reply_to` — unlike `to`, no null case is defined. Guards implementations that copy the `to` handling.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r10",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "in_reply_to": null
+      },
+      "expect": "reject",
+      "reason": "invalid_in_reply_to"
+    },
+    {
+      "name": "reject/from-not-in-allowlist",
+      "why": "A well-formed name that is not a fleet member. The core trust check.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r11",
+        "from": "stranger",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "from_claim_rejected"
+    },
+    {
+      "name": "reject/from-reserved-broadcast",
+      "why": "`broadcast` is reserved and must never resolve to an identity even if an operator lists it in the manifest.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r12",
+        "from": "broadcast",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "from_claim_rejected"
+    },
+    {
+      "name": "reject/from-illegal-characters",
+      "why": "A dotted name is subject-shaped, not identity-shaped, and would widen the allowlist match surface.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r13",
+        "from": "deet.admin",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "from_claim_rejected"
+    },
+    {
+      "name": "reject/from-with-whitespace",
+      "why": "Leading whitespace survives lowercasing and would defeat a naive membership check that trims nothing.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r14",
+        "from": " deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "from_claim_rejected"
+    },
+    {
+      "name": "reject/from-absent",
+      "why": "Absent `from` must reach the same refusal as a rejected claim, not throw.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r15",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "from_claim_rejected"
+    },
+    {
+      "name": "reject/root-id-empty",
+      "why": "An empty chain identity collapses every baton chain into one.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r16",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "",
+        "origin": "deet",
+        "owner": "deet",
+        "hops": 0
+      },
+      "expect": "reject",
+      "reason": "invalid_root_id"
+    },
+    {
+      "name": "reject/root-id-non-string",
+      "why": "Same class as `id`: a non-string chain key never matches its own descendants.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r17",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": 5
+      },
+      "expect": "reject",
+      "reason": "invalid_root_id"
+    },
+    {
+      "name": "reject/origin-not-in-allowlist",
+      "why": "Completion frames are addressed to `origin`. An unlisted origin turns the baton into an arbitrary-destination primitive.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r18",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r18",
+        "origin": "stranger",
+        "owner": "deet",
+        "hops": 0
+      },
+      "expect": "reject",
+      "reason": "invalid_origin"
+    },
+    {
+      "name": "reject/origin-not-canonical",
+      "why": "Baton names must arrive ALREADY canonical — unlike `from`, they are not normalized on the way in. `DEET` would NFKC-fold to an allowlisted name, so an implementation that normalizes first would wrongly accept it.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r19",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r19",
+        "origin": "DEET",
+        "owner": "deet",
+        "hops": 0
+      },
+      "expect": "reject",
+      "reason": "invalid_origin"
+    },
+    {
+      "name": "reject/owner-not-in-allowlist",
+      "why": "`owner` is the current holder; an unlisted holder means no fleet member is accountable for the chain.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r20",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r20",
+        "origin": "deet",
+        "owner": "stranger",
+        "hops": 0
+      },
+      "expect": "reject",
+      "reason": "invalid_owner"
+    },
+    {
+      "name": "reject/owner-non-string",
+      "why": "Guards a normalization path that returns null for non-strings and then compares null to the claim.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r21",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r21",
+        "origin": "deet",
+        "owner": 9,
+        "hops": 0
+      },
+      "expect": "reject",
+      "reason": "invalid_owner"
+    },
+    {
+      "name": "reject/hops-negative",
+      "why": "A negative counter is the reset attack: it buys unlimited further hops under any ceiling check.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r22",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r22",
+        "origin": "deet",
+        "owner": "deet",
+        "hops": -1
+      },
+      "expect": "reject",
+      "reason": "invalid_hops"
+    },
+    {
+      "name": "reject/hops-string-zero",
+      "why": "`\"0\"` is the practical reset: it is falsy-adjacent, compares as a valid low value under loose typing, and is what a model-written handler emits. Both implementations require a true integer.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r23",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r23",
+        "origin": "deet",
+        "owner": "deet",
+        "hops": "0"
+      },
+      "expect": "reject",
+      "reason": "invalid_hops"
+    },
+    {
+      "name": "reject/hops-float",
+      "why": "8.5 is not an integer. In Python `isinstance(True, int)` and float checks are easy to get wrong; in TS every number is a double.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r24",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r24",
+        "origin": "deet",
+        "owner": "deet",
+        "hops": 8.5
+      },
+      "expect": "reject",
+      "reason": "invalid_hops"
+    },
+    {
+      "name": "reject/hops-boolean",
+      "why": "Python's bool IS an int subclass, so `type(x) is not int` is load-bearing here and a switch to isinstance would silently admit `true` as hop 1.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "r25",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "r25",
+        "origin": "deet",
+        "owner": "deet",
+        "hops": true
+      },
+      "expect": "reject",
+      "reason": "invalid_hops"
+    },
+    {
+      "name": "reject/oversize",
+      "why": "One byte past max_bytes. Generated rather than literal so the boundary is exact.",
+      "envelope_generator": "pad_to_one_over_bytes",
+      "expect": "reject",
+      "reason": "envelope_too_large"
+    },
+    {
+      "name": "divergence/hops-at-ceiling",
+      "why": "SPEC says reject at 16, and the ceiling must fire on INBOUND wire validation — otherwise a peer publishing `hops: 100` slips past validate and is caught only if the local bot happens to derive a further increment. TypeScript enforces this; Python enforces it only in derive_baton_fields, so it accepts an at-or-over-ceiling frame off the wire.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "d1",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "d1",
+        "origin": "deet",
+        "owner": "deet",
+        "hops": 16
+      },
+      "expect": "reject",
+      "reason": "invalid_hops_ceiling",
+      "status": "known_divergence",
+      "actual": {
+        "typescript": "reject",
+        "python": "accept"
+      },
+      "resolution": "Port the inbound ceiling check into bus.py::validate_envelope. Tracked as INF-036."
+    },
+    {
+      "name": "divergence/hops-far-over-ceiling",
+      "why": "The same gap at a value no legitimate chain can reach, so the fix cannot be mistaken for an off-by-one.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "d2",
+        "from": "deet",
+        "kind": "baton.handoff",
+        "ts": "2026-09-02T00:00:00Z",
+        "payload": {},
+        "root_id": "d2",
+        "origin": "deet",
+        "owner": "deet",
+        "hops": 100
+      },
+      "expect": "reject",
+      "reason": "invalid_hops_ceiling",
+      "status": "known_divergence",
+      "actual": {
+        "typescript": "reject",
+        "python": "accept"
+      },
+      "resolution": "Same fix as divergence/hops-at-ceiling."
+    },
+    {
+      "name": "divergence/ts-naive-no-offset",
+      "why": "The schema declares `format: date-time`, which is RFC 3339 and requires an offset. A naive timestamp is not a point in time — two bots reading the same audit log disagree about ordering by up to a day. Python requires a trailing Z or numeric offset; TypeScript uses Date.parse, which accepts the naive form and silently interprets it in the host's local zone.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "d3",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "invalid_ts",
+      "status": "known_divergence",
+      "actual": {
+        "typescript": "accept",
+        "python": "reject"
+      },
+      "resolution": "Replace Date.parse with an RFC 3339 check in fleet-bus.ts. Held out of the vectors PR because it can drop live frames from any publisher not using toISOString, so it ships on its own. Tracked as INF-037."
+    },
+    {
+      "name": "divergence/ts-rfc2822",
+      "why": "Date.parse also accepts the RFC 2822 form, which no fleet publisher emits and which the schema does not permit. Same root cause as divergence/ts-naive-no-offset, kept separate so a partial fix cannot claim the whole divergence.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "d4",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "Wed, 02 Sep 2026 00:00:00 GMT",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "invalid_ts",
+      "status": "known_divergence",
+      "actual": {
+        "typescript": "accept",
+        "python": "reject"
+      },
+      "resolution": "Same fix as divergence/ts-naive-no-offset."
+    },
+    {
+      "name": "reject/ts-offset-minutes-60",
+      "why": "Python's fromisoformat NORMALISES `+01:60` to `+02:00` rather than raising, so bus.py carries an explicit regex clamp on the offset fields; Date.parse returns NaN for the same input. Both refuse today and this vector keeps either mechanism from being deleted as redundant — the two reach the same answer by unrelated routes.",
+      "envelope": {
+        "envelope_version": 1,
+        "id": "d5",
+        "from": "deet",
+        "kind": "text_message",
+        "ts": "2026-09-02T00:00:00+01:60",
+        "payload": {}
+      },
+      "expect": "reject",
+      "reason": "invalid_ts"
+    }
+  ]
+}

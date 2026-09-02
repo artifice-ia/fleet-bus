@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: [self-hosted, norstar]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.0"
+      - run: bun install --frozen-lockfile
+      # Scoped to what consumers import. The full project typecheck is red on a
+      # pre-existing error in src/fleet-bus.test.ts:1629 — nats 2.29 types
+      # Status.type as `Events | DebugEvents`, and the skipped permissions test
+      # compares it against 'permissionError'. That needs its own fix; widening
+      # this step before then would only make CI red on arrival.
+      - name: Typecheck shipped sources
+        run: bunx tsc --noEmit --skipLibCheck --module esnext --moduleResolution bundler --target esnext --strict --allowImportingTsExtensions src/fleet-bus.ts conformance/run-ts.ts
+      - name: Unit tests
+        run: bun test src/fleet-bus.test.ts
+      # test/gates is an integration suite: it needs a live NATS server and three
+      # account passwords. It stays a local/manual run (`bun run test:gates`)
+      # until the runner has credentials — a step that cannot pass is worse than
+      # an absent one, because a permanently red job stops being read.
+      - name: Conformance vectors
+        run: bun conformance/run-ts.ts
+      - name: Vector file is valid JSON
+        run: bun -e 'JSON.parse(require("fs").readFileSync("conformance/envelope.v1.vectors.json","utf8"))'
+      # The Python implementation pins a published ref of these two files and its
+      # CI compares byte-for-byte. Printing the hashes here means the value a
+      # consumer must vendor is on the run that produced it, rather than being
+      # recomputed later against a moved branch.
+      - name: Publish consumer hashes
+        run: |
+          sha256sum schema/envelope.v1.schema.json conformance/envelope.v1.vectors.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"

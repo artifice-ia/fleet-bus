@@ -7,17 +7,21 @@
   "types": "./src/fleet-bus.ts",
   "exports": {
     ".": "./src/fleet-bus.ts",
-    "./schema/envelope.v1": "./schema/envelope.v1.schema.json"
+    "./schema/envelope.v1": "./schema/envelope.v1.schema.json",
+    "./conformance/envelope.v1": "./conformance/envelope.v1.vectors.json"
   },
   "files": [
     "src/fleet-bus.ts",
     "schema/envelope.v1.schema.json",
-    "SPEC.md"
+    "SPEC.md",
+    "conformance/envelope.v1.vectors.json"
   ],
   "scripts": {
     "test": "bun test src/fleet-bus.test.ts",
     "test:gates": "bun test/gates/test-suite.ts",
-    "schema:hash": "sha256sum schema/envelope.v1.schema.json"
+    "schema:hash": "sha256sum schema/envelope.v1.schema.json",
+    "conformance": "bun conformance/run-ts.ts",
+    "vectors:hash": "sha256sum conformance/envelope.v1.vectors.json"
   },
   "dependencies": {
     "nats": "^2.29.3",
