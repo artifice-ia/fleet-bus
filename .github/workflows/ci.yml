@@ -10,7 +10,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, norstar]
+    # GitHub-hosted, deliberately. This repo is PUBLIC, the workflow triggers on
+    # pull_request, and none of these steps need a private service — running an
+    # arbitrary contributor's tree on the persistent norstar host would put
+    # `bun install` postinstall scripts on a machine with fleet network access.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2

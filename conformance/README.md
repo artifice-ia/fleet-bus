@@ -26,6 +26,16 @@ Today there are two implementations:
 5. If `normalized_from` is present, assert the accepted envelope carries that
    canonical value — an accept that keeps the raw claim is a failure.
 
+If a vector carries `allowed_from_override`, use it in place of the suite-level
+allowlist for that vector — and **build the set directly, not through the
+implementation's manifest normalizer.** An override exists precisely to hold a
+name the normalizer refuses, so normalizing it would hand the vector back its
+own answer and silently restore the hole the override was added to close.
+
+A vector may also carry `mutation_witness`: the source change that MUST make it
+fail, and only it. That is the vector's own proof that it discriminates, and it
+should be re-run whenever the code it names is touched.
+
 ## Reason codes
 
 Vectors name reasons in their **unprefixed** form: `invalid_root_id`, not

@@ -425,7 +425,7 @@
     },
     {
       "name": "reject/from-reserved-broadcast",
-      "why": "`broadcast` is reserved and must never resolve to an identity even if an operator lists it in the manifest.",
+      "why": "`broadcast` is reserved and must never resolve to an identity EVEN WHEN an operator has listed it in the manifest. That is the whole claim, so this vector carries an allowlist that contains it — with the suite-level allowlist the vector is refused by ordinary membership and stays green after the reserved-name check is deleted.",
       "envelope": {
         "envelope_version": 1,
         "id": "r12",
@@ -435,7 +435,12 @@
         "payload": {}
       },
       "expect": "reject",
-      "reason": "from_claim_rejected"
+      "reason": "from_claim_rejected",
+      "allowed_from_override": [
+        "deet",
+        "broadcast"
+      ],
+      "mutation_witness": "Delete the RESERVED_BOT_NAMES check from normalizeBotName / normalize_bot_name; this vector MUST fail and no other vector may."
     },
     {
       "name": "reject/from-illegal-characters",

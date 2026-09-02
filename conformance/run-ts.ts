@@ -22,6 +22,7 @@ interface Vector {
   expect: 'accept' | 'reject'
   reason?: string
   normalized_from?: string
+  allowed_from_override?: string[]
   status?: string
   actual?: Record<string, 'accept' | 'reject'>
 }
@@ -90,7 +91,13 @@ for (const vector of suite.vectors as Vector[]) {
 
   let result: ReturnType<typeof validateEnvelope>
   try {
-    result = validateEnvelope(inputFor(vector), allowed, maxBytes)
+    // Built directly, NOT through normalizeAllowlist: an override exists to hold a
+    // name the normalizer refuses, and running it through the very code under test
+    // would hand the vector back its own answer.
+    const vectorAllowed = vector.allowed_from_override
+      ? new Set(vector.allowed_from_override)
+      : allowed
+    result = validateEnvelope(inputFor(vector), vectorAllowed, maxBytes)
   } catch (error) {
     failures.push(`${vector.name}: threw ${String(error)}`)
     continue
