@@ -32,9 +32,15 @@ implementation's manifest normalizer.** An override exists precisely to hold a
 name the normalizer refuses, so normalizing it would hand the vector back its
 own answer and silently restore the hole the override was added to close.
 
-A vector may also carry `mutation_witness`: the source change that MUST make it
-fail, and only it. That is the vector's own proof that it discriminates, and it
-should be re-run whenever the code it names is touched.
+A vector may also carry `mutation_witness`. It is **non-normative free text and
+every runner ignores it** — a review recipe, naming the source change that was
+observed to kill this vector and nothing else. Re-run it by hand when the code
+it names is touched.
+
+It is deliberately not proof. Nothing checks that the recipe still applies, that
+the symbol it names still exists, or that the mutation still fails exactly one
+vector, so a stale recipe leaves CI green. Read it as a pointer to where a
+reviewer should aim, and re-derive the result rather than citing the field.
 
 ## Reason codes
 
