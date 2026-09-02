@@ -148,7 +148,7 @@ fleet bot. **FB-3 is the slice that would deploy it, so this must close first.**
 The fix belongs in yugo, not here: two implementations and the broker's own
 permission grants agree with each other, and the third does not.
 
-Tracked as **INF-039**.
+Tracked as **INF-036**.
 
 ### 6.3 — JetStream capture (FB-1, applied 2026-09-02)
 
