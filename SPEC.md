@@ -107,7 +107,7 @@ Client inboxes:
 - `_INBOX_<bot>.>` — the NATS request/reply inbox, per the `inboxPrefix` rule
   below. **Not an application subject**; nothing addresses a bot there.
 
-### 6.1 — The reply lane is `.result`. It is not being removed.
+### 6.1 — The reply lane TODAY is `.result`. Removal happens in FB-3.
 
 **A publisher selects the subject from `in_reply_to`, not from the kind:**
 
@@ -122,12 +122,13 @@ the reply path of `fleet-bus.ts`, and the TypeScript client's correlated
 `request(wait: true)` **resolves only on a matching `.result`** — a reply
 delivered anywhere else leaves the caller waiting until timeout.
 
-**This clause exists because the roadmap said the opposite.** FB-2 was scoped as
-"declare subject topology; remove the `.result` class", on the strength of one
-implementation having already dropped it. Checking the other two first inverted
-the conclusion: `.result` is used by both deployed implementations, is granted
-in every bot's subscribe and publish permissions, and as of FB-1 has a JetStream
-stream (`FLEET_RESULT`) capturing it. **The subject class stays.**
+**This clause describes the live wire, not the end state.** `.result` is used by
+both deployed implementations, is granted in every bot's subscribe and publish
+permissions, and as of FB-1 has a JetStream stream (`FLEET_RESULT`) capturing
+it. **The subject class stays until FB-3 removes it** — §6.2 has the target and
+the migration. Everything in §6 is live-state documentation: it says what a
+publisher must do to be understood today, and it stops being true at the
+cutover, not before.
 
 ### 6.2 — The reply lane is mid-migration, and yugo is ahead of it
 
@@ -154,15 +155,43 @@ and the exchange ends in a timeout indistinguishable from an unresponsive bot.
 Replies sent *to* yugo on `.result` are subscribed but deliberately not injected.
 
 Nothing is broken in production only because yugo is not deployed to a fleet bot.
-**FB-3 is the slice that deploys it, and FB-3 is also the slice that moves the
-other adapters off `.result`** — per yugo's own §15 erratum, that migration means
-three things its earlier item list omitted: migrate reply publication to
-`.request` + `in_reply_to`, delete the `.result` receive path including 0.7.0's
-waiter ledger rather than leaving it dormant, and revoke `.result` authz in
-**both** directions, publish as well as subscribe.
 
-Until then `.result` stays in this document, because it is what the wire does.
-Tracked as **INF-036**.
+### 6.2.1 — The migration cannot be "one adapter per PR, in any order"
+
+Yugo §15 defines FB-3 as separate per-adapter PRs that land in any order. **For
+the reply lane specifically, that ordering strands peers**, and the section
+above would otherwise warn about a hazard its own plan creates:
+
+- a migrated adapter replies on `.request`, where an unmigrated receiver injects
+  it as a new request instead of resolving the waiter that is still listening
+  on `.result`;
+- an unmigrated adapter replies on `.result`, which a migrated receiver has
+  deleted and had revoked.
+
+Either direction breaks a correlated call, and both are live the moment the
+first adapter flips.
+
+**The resolution is a compatibility phase — expand, migrate, contract.** Only
+the last step is fleet-wide, and by then it moves no traffic:
+
+1. **Expand (per adapter, any order).** Every adapter *receives and correlates*
+   on **both** lanes. Nothing changes about what it publishes, so this step is
+   invisible on the wire and cannot strand anyone.
+2. **Migrate (per adapter, any order).** The adapter switches reply
+   *publication* to `.request` + `in_reply_to`. Safe in any order precisely
+   because step 1 left every peer able to receive either lane.
+3. **Contract (once, fleet-wide, after every adapter has done 2).** Delete the
+   `.result` receive path — including 0.7.0's waiter ledger, rather than
+   leaving it dormant — and revoke `.result` authz in **both** directions,
+   publish as well as subscribe. Revoking subscribe alone would leave every bot
+   able to publish to a channel nothing gates.
+
+Step 3 is the only atomic one, and it is cheap: no traffic uses `.result` by
+then. **"Any order" survives for the two steps that touch adapters; the one
+step that cannot be incremental is the one that moves nothing.**
+
+Until step 3 lands, `.result` stays in this document, because it is what the
+wire does. Tracked as **INF-036**.
 
 ### 6.3 — JetStream capture (FB-1, applied 2026-09-02)
 
