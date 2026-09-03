@@ -171,8 +171,9 @@ above would otherwise warn about a hazard its own plan creates:
 Either direction breaks a correlated call, and both are live the moment the
 first adapter flips.
 
-**The resolution is a compatibility phase — expand, migrate, contract.** Only
-the last step is fleet-wide, and by then it moves no traffic:
+**The resolution is a compatibility phase — expand, migrate, contract.** Every
+step is per-adapter and order-independent; the only fleet-wide element is a
+barrier between steps 2 and 3:
 
 1. **Expand (per adapter, any order).** Every adapter *receives and correlates*
    on **both** lanes. Nothing changes about what it publishes, so this step is
@@ -180,15 +181,29 @@ the last step is fleet-wide, and by then it moves no traffic:
 2. **Migrate (per adapter, any order).** The adapter switches reply
    *publication* to `.request` + `in_reply_to`. Safe in any order precisely
    because step 1 left every peer able to receive either lane.
-3. **Contract (once, fleet-wide, after every adapter has done 2).** Delete the
-   `.result` receive path — including 0.7.0's waiter ledger, rather than
-   leaving it dormant — and revoke `.result` authz in **both** directions,
-   publish as well as subscribe. Revoking subscribe alone would leave every bot
-   able to publish to a channel nothing gates.
+3. **Contract (per adapter, any order, behind a barrier).** Delete the
+   `.result` **subscription and handler** and any result-specific state, and
+   revoke `.result` authz in **both** directions — publish as well as
+   subscribe. Revoking subscribe alone would leave every bot able to publish to
+   a channel nothing gates. Once no adapter subscribes it, remove the
+   `FLEET_RESULT` stream.
 
-Step 3 is the only atomic one, and it is cheap: no traffic uses `.result` by
-then. **"Any order" survives for the two steps that touch adapters; the one
-step that cannot be incremental is the one that moves nothing.**
+**Keep the outbound waiter ledger.** An earlier revision of this section said to
+delete it along with the `.result` receive path, copied from yugo's §15 erratum
+without checking what it holds. That ledger is **subject-independent
+correlation state**: expanded adapters need it to resolve `in_reply_to` on both
+lanes during step 1, and after step 2 it is still the mechanism that resolves a
+reply arriving on `.request`. Deleting it does not remove a `.result`
+dependency — it removes `request(wait: true)` from the target topology
+altogether, which is a separate breaking change and would have to be decided as
+one.
+
+**What is global is the BARRIER, not the operation.** Every adapter must finish
+step 2 before any adapter starts step 3; after that gate, contraction is
+per-adapter in any order, because the lane carries no traffic and no peer can
+be stranded by it. Cross-repo code deletion could not have been one atomic
+operation in any case. **"Any order" survives at all three steps; the only
+fleet-wide thing is a precondition.**
 
 Until step 3 lands, `.result` stays in this document, because it is what the
 wire does. Tracked as **INF-036**.
