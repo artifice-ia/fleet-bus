@@ -107,7 +107,7 @@ Client inboxes:
 - `_INBOX_<bot>.>` — the NATS request/reply inbox, per the `inboxPrefix` rule
   below. **Not an application subject**; nothing addresses a bot there.
 
-### 6.1 — The reply lane is `.result`. It is not being removed.
+### 6.1 — The reply lane TODAY is `.result`. Removal happens in FB-3.
 
 **A publisher selects the subject from `in_reply_to`, not from the kind:**
 
@@ -122,33 +122,109 @@ the reply path of `fleet-bus.ts`, and the TypeScript client's correlated
 `request(wait: true)` **resolves only on a matching `.result`** — a reply
 delivered anywhere else leaves the caller waiting until timeout.
 
-**This clause exists because the roadmap said the opposite.** FB-2 was scoped as
-"declare subject topology; remove the `.result` class", on the strength of one
-implementation having already dropped it. Checking the other two first inverted
-the conclusion: `.result` is used by both deployed implementations, is granted
-in every bot's subscribe and publish permissions, and as of FB-1 has a JetStream
-stream (`FLEET_RESULT`) capturing it. **The subject class stays.**
+**This clause describes the live wire, not the end state.** `.result` is used by
+both deployed implementations, is granted in every bot's subscribe and publish
+permissions, and as of FB-1 has a JetStream stream (`FLEET_RESULT`) capturing
+it. **The subject class stays until FB-3 removes it** — §6.2 has the target and
+the migration. Everything in §6 is live-state documentation: it says what a
+publisher must do to be understood today, and it stops being true at the
+cutover, not before.
 
-### 6.2 — Known divergence: yugo replies on the wrong lane
+### 6.2 — The reply lane is mid-migration, and yugo is ahead of it
 
 `yugo/fleet_bus.py` publishes replies as ordinary `.request` envelopes carrying
-`in_reply_to`, and treats `.result` as a subject class removed by "SPEC §7".
-**No section of this document removed it**, and its own source comment records
-the conflict rather than resolving it.
+`in_reply_to`, and does not use `.result`.
 
-The consequence is not cosmetic: **a correlated `request(wait: true)` from a
-`fleet-bus.ts` peer to a yugo bot can never resolve.** Yugo answers on
-`.request`, the caller is listening on `.result`, and the exchange ends in a
-timeout that looks exactly like an unresponsive bot. Yugo also drains its own
-`.result` subscription without acting on it, so a reply sent *to* yugo by either
-other implementation is dropped.
+**That is the ratified target, not a defect.** Yugo's SPEC §4.7 — the v0.7 authz
+map — states plainly: *"`.result` subject class is REMOVED (was in v4 spec).
+Replies travel as ordinary `.request` envelopes with an `in_reply_to` field;
+coordinator gates them by matching `root_id`."* Fernando confirmed the removal
+on 2026-08-29. Yugo implements the end state early; this document describes the
+wire the fleet runs today. **Both are correct about different points in time.**
 
-Nothing is broken in production today only because yugo is not yet deployed to a
-fleet bot. **FB-3 is the slice that would deploy it, so this must close first.**
-The fix belongs in yugo, not here: two implementations and the broker's own
-permission grants agree with each other, and the third does not.
+An earlier revision of this section had it backwards — it called yugo the
+divergence and said the fix belonged there. It is recorded rather than quietly
+replaced, because the reasoning that produced it will recur: two implementations
+agreeing is not evidence when the third is the one implementing the approved
+change, and a majority is not an argument about direction.
 
-Tracked as **INF-036**.
+**What does hold is the interop consequence.** Until the migration completes,
+**a correlated `request(wait: true)` from a `fleet-bus.ts` peer to a yugo bot
+cannot resolve.** Yugo answers on `.request`, the caller listens on `.result`,
+and the exchange ends in a timeout indistinguishable from an unresponsive bot.
+Replies sent *to* yugo on `.result` are subscribed but deliberately not injected.
+
+Nothing is broken in production only because yugo is not deployed to a fleet bot.
+
+### 6.2.1 — The migration cannot be "one adapter per PR, in any order"
+
+Yugo §15 defines FB-3 as separate per-adapter PRs that land in any order. **For
+the reply lane specifically, that ordering strands peers**, and the section
+above would otherwise warn about a hazard its own plan creates:
+
+- a migrated adapter replies on `.request`, where an unmigrated receiver injects
+  it as a new request instead of resolving the waiter that is still listening
+  on `.result`;
+- an unmigrated adapter replies on `.result`, which a migrated receiver has
+  deleted and had revoked.
+
+Either direction breaks a correlated call, and both are live the moment the
+first adapter flips.
+
+**The resolution is a compatibility phase — expand, migrate, contract.** Within
+each phase adapters proceed in any order; **between phases there is a global
+completion gate.** Two of them, not one:
+
+1. **Expand (per adapter, any order).** Every adapter *receives and correlates*
+   on **both** lanes. Nothing changes about what it publishes, so this step is
+   invisible on the wire and cannot strand anyone.
+   **Gate 1: every adapter completes Expand before any adapter begins
+   Migrate.**
+
+2. **Migrate (per adapter, any order, after Gate 1).** The adapter switches
+   reply *publication* to `.request` + `in_reply_to`. Order within the phase is
+   free because Gate 1 left **every** peer able to receive either lane —
+   "every" is the load-bearing word, and it is why the gate is not optional.
+   Without it: A expands, then migrates before B has expanded, A replies to B
+   on `.request`, B's old receive path injects it as a fresh request, and B's
+   waiter on `.result` times out. That is the same stranding this section
+   exists to prevent, reintroduced by the ordering freedom rather than the
+   change.
+
+   **Gate 2: every adapter completes Migrate before any adapter begins
+   Contract.**
+3. **Contract (per adapter, any order, after Gate 2).** Delete the
+   `.result` **subscription and handler** and any result-specific state, and
+   revoke `.result` authz in **both** directions — publish as well as
+   subscribe. Revoking subscribe alone would leave every bot able to publish to
+   a channel nothing gates. Once no adapter subscribes it, remove the
+   `FLEET_RESULT` stream.
+
+**Keep the outbound waiter ledger.** An earlier revision of this section said to
+delete it along with the `.result` receive path, copied from yugo's §15 erratum
+without checking what it holds. That ledger is **subject-independent
+correlation state**: expanded adapters need it to resolve `in_reply_to` on both
+lanes during step 1, and after step 2 it is still the mechanism that resolves a
+reply arriving on `.request`. Deleting it does not remove a `.result`
+dependency — it removes `request(wait: true)` from the target topology
+altogether, which is a separate breaking change and would have to be decided as
+one.
+
+**What is global is the GATES, not any operation.** No step is an atomic
+fleet-wide cutover — cross-repo code deletion could not be one in any case.
+What must hold globally is a precondition before each phase begins, and each
+gate exists because the phase after it is only safe once the phase before it is
+universally true. **"Any order" survives inside all three phases; what does not
+survive is starting a phase early.**
+
+An earlier revision named only Gate 2, and claimed Migrate was safe in any
+order "because step 1 left every peer able to receive either lane" — a property
+of *all* adapters having expanded, asserted as though one adapter expanding
+established it. Both gates are the same error caught twice: a phase's safety is
+a fleet-wide fact, and a per-adapter step does not create one.
+
+Until step 3 lands, `.result` stays in this document, because it is what the
+wire does. Tracked as **INF-036**.
 
 ### 6.3 — JetStream capture (FB-1, applied 2026-09-02)
 
