@@ -129,25 +129,39 @@ the conclusion: `.result` is used by both deployed implementations, is granted
 in every bot's subscribe and publish permissions, and as of FB-1 has a JetStream
 stream (`FLEET_RESULT`) capturing it. **The subject class stays.**
 
-### 6.2 — Known divergence: yugo replies on the wrong lane
+### 6.2 — The reply lane is mid-migration, and yugo is ahead of it
 
 `yugo/fleet_bus.py` publishes replies as ordinary `.request` envelopes carrying
-`in_reply_to`, and treats `.result` as a subject class removed by "SPEC §7".
-**No section of this document removed it**, and its own source comment records
-the conflict rather than resolving it.
+`in_reply_to`, and does not use `.result`.
 
-The consequence is not cosmetic: **a correlated `request(wait: true)` from a
-`fleet-bus.ts` peer to a yugo bot can never resolve.** Yugo answers on
-`.request`, the caller is listening on `.result`, and the exchange ends in a
-timeout that looks exactly like an unresponsive bot. Yugo also drains its own
-`.result` subscription without acting on it, so a reply sent *to* yugo by either
-other implementation is dropped.
+**That is the ratified target, not a defect.** Yugo's SPEC §4.7 — the v0.7 authz
+map — states plainly: *"`.result` subject class is REMOVED (was in v4 spec).
+Replies travel as ordinary `.request` envelopes with an `in_reply_to` field;
+coordinator gates them by matching `root_id`."* Fernando confirmed the removal
+on 2026-08-29. Yugo implements the end state early; this document describes the
+wire the fleet runs today. **Both are correct about different points in time.**
 
-Nothing is broken in production today only because yugo is not yet deployed to a
-fleet bot. **FB-3 is the slice that would deploy it, so this must close first.**
-The fix belongs in yugo, not here: two implementations and the broker's own
-permission grants agree with each other, and the third does not.
+An earlier revision of this section had it backwards — it called yugo the
+divergence and said the fix belonged there. It is recorded rather than quietly
+replaced, because the reasoning that produced it will recur: two implementations
+agreeing is not evidence when the third is the one implementing the approved
+change, and a majority is not an argument about direction.
 
+**What does hold is the interop consequence.** Until the migration completes,
+**a correlated `request(wait: true)` from a `fleet-bus.ts` peer to a yugo bot
+cannot resolve.** Yugo answers on `.request`, the caller listens on `.result`,
+and the exchange ends in a timeout indistinguishable from an unresponsive bot.
+Replies sent *to* yugo on `.result` are subscribed but deliberately not injected.
+
+Nothing is broken in production only because yugo is not deployed to a fleet bot.
+**FB-3 is the slice that deploys it, and FB-3 is also the slice that moves the
+other adapters off `.result`** — per yugo's own §15 erratum, that migration means
+three things its earlier item list omitted: migrate reply publication to
+`.request` + `in_reply_to`, delete the `.result` receive path including 0.7.0's
+waiter ledger rather than leaving it dormant, and revoke `.result` authz in
+**both** directions, publish as well as subscribe.
+
+Until then `.result` stays in this document, because it is what the wire does.
 Tracked as **INF-036**.
 
 ### 6.3 — JetStream capture (FB-1, applied 2026-09-02)
