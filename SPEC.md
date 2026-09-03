@@ -171,17 +171,29 @@ above would otherwise warn about a hazard its own plan creates:
 Either direction breaks a correlated call, and both are live the moment the
 first adapter flips.
 
-**The resolution is a compatibility phase — expand, migrate, contract.** Every
-step is per-adapter and order-independent; the only fleet-wide element is a
-barrier between steps 2 and 3:
+**The resolution is a compatibility phase — expand, migrate, contract.** Within
+each phase adapters proceed in any order; **between phases there is a global
+completion gate.** Two of them, not one:
 
 1. **Expand (per adapter, any order).** Every adapter *receives and correlates*
    on **both** lanes. Nothing changes about what it publishes, so this step is
    invisible on the wire and cannot strand anyone.
-2. **Migrate (per adapter, any order).** The adapter switches reply
-   *publication* to `.request` + `in_reply_to`. Safe in any order precisely
-   because step 1 left every peer able to receive either lane.
-3. **Contract (per adapter, any order, behind a barrier).** Delete the
+   **Gate 1: every adapter completes Expand before any adapter begins
+   Migrate.**
+
+2. **Migrate (per adapter, any order, after Gate 1).** The adapter switches
+   reply *publication* to `.request` + `in_reply_to`. Order within the phase is
+   free because Gate 1 left **every** peer able to receive either lane —
+   "every" is the load-bearing word, and it is why the gate is not optional.
+   Without it: A expands, then migrates before B has expanded, A replies to B
+   on `.request`, B's old receive path injects it as a fresh request, and B's
+   waiter on `.result` times out. That is the same stranding this section
+   exists to prevent, reintroduced by the ordering freedom rather than the
+   change.
+
+   **Gate 2: every adapter completes Migrate before any adapter begins
+   Contract.**
+3. **Contract (per adapter, any order, after Gate 2).** Delete the
    `.result` **subscription and handler** and any result-specific state, and
    revoke `.result` authz in **both** directions — publish as well as
    subscribe. Revoking subscribe alone would leave every bot able to publish to
@@ -198,12 +210,18 @@ dependency — it removes `request(wait: true)` from the target topology
 altogether, which is a separate breaking change and would have to be decided as
 one.
 
-**What is global is the BARRIER, not the operation.** Every adapter must finish
-step 2 before any adapter starts step 3; after that gate, contraction is
-per-adapter in any order, because the lane carries no traffic and no peer can
-be stranded by it. Cross-repo code deletion could not have been one atomic
-operation in any case. **"Any order" survives at all three steps; the only
-fleet-wide thing is a precondition.**
+**What is global is the GATES, not any operation.** No step is an atomic
+fleet-wide cutover — cross-repo code deletion could not be one in any case.
+What must hold globally is a precondition before each phase begins, and each
+gate exists because the phase after it is only safe once the phase before it is
+universally true. **"Any order" survives inside all three phases; what does not
+survive is starting a phase early.**
+
+An earlier revision named only Gate 2, and claimed Migrate was safe in any
+order "because step 1 left every peer able to receive either lane" — a property
+of *all* adapters having expanded, asserted as though one adapter expanding
+established it. Both gates are the same error caught twice: a phase's safety is
+a fleet-wide fact, and a per-adapter step does not create one.
 
 Until step 3 lands, `.result` stays in this document, because it is what the
 wire does. Tracked as **INF-036**.
