@@ -89,22 +89,106 @@ Every consumer MUST emit exactly these reject codes on validation failure (this 
 
 ## 6 — NATS subject conventions
 
+**Normative, and read off the running broker on 2026-09-02 rather than off a
+plan.** Every subject below exists in `nats.conf`'s per-user permissions today.
+
 Per-bot subjects — each bot owns three:
 
 - `fleet.<bot>.request` — direct requests targeting `<bot>`
-- `fleet.<bot>.result` — replies addressed to `<bot>` (via `in_reply_to`)
+- `fleet.<bot>.result` — replies addressed to `<bot>`, carrying `in_reply_to`
 - `fleet.<bot>.status` — heartbeats and status pings originating from `<bot>`
 
 Broadcast subjects:
 
 - `fleet.broadcast.<kind>` — fleet-wide broadcasts (subscribers optional per bot)
 
+Client inboxes:
+
+- `_INBOX_<bot>.>` — the NATS request/reply inbox, per the `inboxPrefix` rule
+  below. **Not an application subject**; nothing addresses a bot there.
+
+### 6.1 — The reply lane is `.result`. It is not being removed.
+
+**A publisher selects the subject from `in_reply_to`, not from the kind:**
+
+```
+to == null                 → fleet.broadcast.<kind>
+to != null, no in_reply_to → fleet.<to>.request
+to != null, in_reply_to    → fleet.<to>.result
+```
+
+That rule is implemented identically in `pick_publish_subject` (`bus.py`) and in
+the reply path of `fleet-bus.ts`, and the TypeScript client's correlated
+`request(wait: true)` **resolves only on a matching `.result`** — a reply
+delivered anywhere else leaves the caller waiting until timeout.
+
+**This clause exists because the roadmap said the opposite.** FB-2 was scoped as
+"declare subject topology; remove the `.result` class", on the strength of one
+implementation having already dropped it. Checking the other two first inverted
+the conclusion: `.result` is used by both deployed implementations, is granted
+in every bot's subscribe and publish permissions, and as of FB-1 has a JetStream
+stream (`FLEET_RESULT`) capturing it. **The subject class stays.**
+
+### 6.2 — Known divergence: yugo replies on the wrong lane
+
+`yugo/fleet_bus.py` publishes replies as ordinary `.request` envelopes carrying
+`in_reply_to`, and treats `.result` as a subject class removed by "SPEC §7".
+**No section of this document removed it**, and its own source comment records
+the conflict rather than resolving it.
+
+The consequence is not cosmetic: **a correlated `request(wait: true)` from a
+`fleet-bus.ts` peer to a yugo bot can never resolve.** Yugo answers on
+`.request`, the caller is listening on `.result`, and the exchange ends in a
+timeout that looks exactly like an unresponsive bot. Yugo also drains its own
+`.result` subscription without acting on it, so a reply sent *to* yugo by either
+other implementation is dropped.
+
+Nothing is broken in production today only because yugo is not yet deployed to a
+fleet bot. **FB-3 is the slice that would deploy it, so this must close first.**
+The fix belongs in yugo, not here: two implementations and the broker's own
+permission grants agree with each other, and the third does not.
+
+Tracked as **INF-036**.
+
+### 6.3 — JetStream capture (FB-1, applied 2026-09-02)
+
+Two streams persist the request and reply lanes. Applied to the live broker;
+these are the running values, not a proposal.
+
+| Stream | Subjects | Retention | Per subject | Discard | Storage |
+|---|---|---|---|---|---|
+| `FLEET_REQUEST` | `fleet.*.request` | 7 days | 100,000 | old | file |
+| `FLEET_RESULT` | `fleet.*.result` | 7 days | 100,000 | old | file |
+
+`fleet.*.status` and `fleet.broadcast.>` are deliberately **not** captured:
+heartbeats are presence, and replaying a broadcast to a bot that was offline
+re-delivers an announcement whose moment has passed.
+
+Three consequences worth stating, because each one was verified rather than
+assumed:
+
+- **A core publish still lands in the stream.** A client with no JetStream
+  permission at all publishes normally and its messages are captured, so bots
+  migrate to durable consumers one at a time. There is no flag day.
+- **Every user needs `$JS.API.>` on both verbs** to bind a consumer. Without it
+  the client does not fail cleanly — the JetStream request **times out**, which
+  reads as a hung bot rather than a misconfigured one.
+- **The client's custom `inboxPrefix` applies to JetStream API calls too.** An
+  ops script that omits it is refused by the same permission rule.
+
 Per-user NATS permissions:
 
 - Each bot has NATS user `<botname>` with password from `~/.claude/fleet-bus-tokens.conf`
 - Subscribe: `fleet.<self>.request`, `fleet.<self>.result`, `fleet.<self>.status`, `fleet.broadcast.>`, `_INBOX_<self>.>`, plus optional read-only observation subjects
 - Publish: `fleet.*.request`, `fleet.*.result`, `fleet.<self>.status` (self only), `fleet.broadcast.>`, `_INBOX_<self>.>`
-- Console (supervision) user: subscribe `fleet.>`; publish `{ deny: [">"] }`
+- **Both verbs additionally grant `$JS.API.>` (FB-1).** JetStream's API is a
+  request/reply exchange, so a consumer needs it on subscribe *and* publish;
+  granting one is the same as granting neither.
+- Console (supervision) user: subscribe `fleet.>`; publish `{ deny: [">"] }`.
+  **Console therefore cannot use the JetStream API at all** — it is
+  publish-denied by design, and the API needs publish. A read-only observer
+  cannot inspect streams. Acceptable while nothing depends on it; it needs a
+  decision before FB-4's gate suite wants an observer.
 
 NATS client MUST pass `inboxPrefix: '_INBOX_<botname>'` on connect. Without this, `nc.request()` uses `_INBOX.<random>` and fails the per-user subscribe permission with `Permissions Violation` — this kills the connection.
 

@@ -689,7 +689,7 @@
         "typescript": "reject",
         "python": "accept"
       },
-      "resolution": "Port the inbound ceiling check into bus.py::validate_envelope. Tracked as INF-036."
+      "resolution": "Port the inbound ceiling check into bus.py::validate_envelope. Tracked as INF-037."
     },
     {
       "name": "divergence/hops-far-over-ceiling",
@@ -733,7 +733,7 @@
         "typescript": "accept",
         "python": "reject"
       },
-      "resolution": "Replace Date.parse with an RFC 3339 check in fleet-bus.ts. Held out of the vectors PR because it can drop live frames from any publisher not using toISOString, so it ships on its own. Tracked as INF-037."
+      "resolution": "Replace Date.parse with an RFC 3339 check in fleet-bus.ts. Held out of the vectors PR because it can drop live frames from any publisher not using toISOString, so it ships on its own. Tracked as INF-038."
     },
     {
       "name": "divergence/ts-rfc2822",

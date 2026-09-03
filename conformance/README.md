@@ -99,7 +99,7 @@ These vectors cover **validation of a decoded wire frame**. Deliberately outside
   differ: `bus.py` encodes with `allow_nan=False` and refuses, while
   `validateEnvelope` encodes with a bare `JSON.stringify` and silently coerces
   `NaN` to `null` on the wire — `payloadIsJsonSerializable` exists in the same
-  file for exactly this and is not called by the validator. Tracked as INF-038.
+  file for exactly this and is not called by the validator. Tracked as INF-039.
 - **Recipient matching.** `bus.py` takes a `recipient` argument and can return
   `recipient_mismatch`; the TypeScript validator has no such parameter and does
   that check at the subscription. It is a receiver-side concern, not an envelope
